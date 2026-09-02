@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import torch
+from aiter import QuantType, dtypes
+from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
-from aiter import dtypes
-from aiter import QuantType
 
-# Lazy import mori
 try:
     import mori
 
@@ -19,6 +23,149 @@ try:
 except ImportError:
     mori = None  # type: ignore
     MORI_AVAILABLE = False
+
+logger = logging.getLogger("atom")
+
+
+_NUM_TBO_UBATCHES = 2
+
+
+def select_mori_kernel_params(
+    *, low_latency: bool, internode: bool
+) -> tuple[str, int, int, int]:
+    """Pick the MoRI kernel and its launch geometry.
+
+    Returns ``(kernel_name, warp_num_per_block, block_num, rdma_block_num)``.
+    The name is resolved against ``mori.ops.EpDispatchCombineKernelType`` by the
+    caller so this stays importable (and testable) without mori installed.
+
+    `internode` must come from a real topology probe. It used to be inferred
+    from ``world_size <= 8``, which is a GPUs-per-node assumption rather than a
+    measurement: 2 nodes x 4 GPUs reads as intra-node and selects kernels that
+    assume P2P mappings across a boundary that has none.
+    """
+    if low_latency:
+        return ("AsyncLL", 8, 64, 32)
+    if internode:
+        return ("InterNodeV1", 16, 32, 16)
+    return ("IntraNode", 16, 80, 0)
+
+
+@lru_cache(maxsize=8)
+def init_mori_op(
+    rank: int,
+    world_size: int,
+    hidden_dim: int,
+    scale_dim: int,
+    max_num_inp_token_per_rank: int,
+    num_local_experts: int,
+    num_experts_per_token: int,
+    gpu_per_node: int,
+    data_type_itemsize: int,
+    max_token_type_size: int,
+    low_latency: bool = False,
+    internode: bool = False,
+    instance_id: int = 0,
+    scale_type_size: int = torch.float32.itemsize,
+    quant_type: str = "none",
+) -> Any:
+    """
+    Create a mori op instance.
+      - low_latency=True  → AsyncLL (dispatch_send/recv, combine_send/recv)
+      - internode=True    → InterNodeV1 (RDMA across nodes)
+      - otherwise         → IntraNode
+    """
+    import mori
+
+    data_type = torch.float8_e4m3fnuz
+    for dt in [torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.bfloat16]:
+        if dt.itemsize == data_type_itemsize:
+            data_type = dt
+            break
+
+    kernel_name, warp_num_per_block, block_num, rdma_block_num = (
+        select_mori_kernel_params(low_latency=low_latency, internode=internode)
+    )
+    kernel_type = getattr(mori.ops.EpDispatchCombineKernelType, kernel_name)
+
+    mori_config = mori.ops.EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
+        quant_type=quant_type,
+        max_token_type_size=max_token_type_size,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_local_experts,
+        num_experts_per_token=num_experts_per_token,
+        warp_num_per_block=warp_num_per_block,
+        block_num=block_num,
+        kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
+        rdma_block_num=rdma_block_num,
+        **({"num_qp_per_pe": 2} if low_latency else {}),
+    )
+    mori_op = mori.ops.EpDispatchCombineOp(mori_config)
+    logger.info(
+        f"[MORI] Created {kernel_type} mori_op instance_id={instance_id}: "
+        f"{rank=} {world_size=} {hidden_dim=} {num_local_experts=} "
+        f"{num_experts_per_token=}"
+    )
+    return mori_op
+
+
+_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+)
+
+# Read once at import: the wire format is fixed for the life of the process, and
+# make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
+# not cache, so binding here also keeps it to a single getenv.
+_FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
+
+
+@dataclass(frozen=True)
+class MoriDispatchFormat:
+    dtype: torch.dtype  # what dispatch() receives -> picks the MoRI kernel
+    quant_type: Any | None  # aiter QuantType for the pre-dispatch quantizer
+    scale_dim: int
+    scale_type_size: int
+
+    @property
+    def is_fp4(self) -> bool:
+        return self.dtype == dtypes.fp4x2
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.dtype in _FP8_DTYPES
+
+
+def resolve_mori_dispatch(
+    in_dtype: torch.dtype,
+    hidden_dim: int,
+    quant_config: FusedMoEQuantConfig | None = None,
+) -> MoriDispatchFormat:
+    """Decide the MoRI wire format. Call once per layer construction."""
+    if _FP4_DISPATCH:
+        # fp4 blockwise is one scale per 32 elements, not per 128 as fp8 uses,
+        # and get_hip_quant(per_1x32) emits e8m0 scales (1 byte), not fp32.
+        return MoriDispatchFormat(
+            dtype=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            scale_dim=hidden_dim // 32,
+            scale_type_size=torch.float8_e8m0fnu.itemsize,
+        )
+    return MoriDispatchFormat(
+        dtype=in_dtype,
+        quant_type=None,
+        scale_dim=0,
+        scale_type_size=torch.float32.itemsize,
+    )
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
@@ -28,12 +175,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     def __init__(
         self,
-        mori_op: Any,  # mori.ops.EpDispatchCombineOp when mori is available
+        mori_op: Any,
         max_tokens_per_rank: int,
         num_dispatchers: int,
-        use_fp8_dispatch: bool = False,
-        quant_type=None,
+        dispatch_format: MoriDispatchFormat,
         quant_dtype: torch.dtype = None,
+        is_async: bool = False,
+        tbo_mori_ops: list | None = None,
+        low_latency: bool = False,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -41,12 +190,28 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 "Please install mori to use this feature."
             )
         super().__init__()
-        self.mori_op = mori_op
+        self._sync_mori_op = mori_op
+        self._tbo_mori_ops = tbo_mori_ops  # per-ubatch ops for TBO (IntraNode)
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
-        self.use_fp8_dispatch = use_fp8_dispatch
-        self.quant_type = quant_type
+        self.dispatch_format = dispatch_format
         self.quant_dtype = quant_dtype
+        self._is_async = is_async
+        self._low_latency = low_latency
+
+    # Derived from the resolved format so there is no second copy to keep in
+    # sync with the staging config.
+    @property
+    def use_fp4_dispatch(self) -> bool:
+        return self.dispatch_format.is_fp4
+
+    @property
+    def use_fp8_dispatch(self) -> bool:
+        return self.dispatch_format.is_fp8
+
+    @property
+    def quant_type(self):
+        return self.dispatch_format.quant_type
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -65,7 +230,37 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         return torch.int32
 
     def supports_async(self) -> bool:
-        return False
+        if not self._is_async:
+            return False
+        from atom.utils.tbo.ubatching import tbo_active
+
+        return tbo_active()
+
+    def _get_dispatch_config(self, num_tokens: int | None = None) -> tuple[int, int]:
+        """Return (block_num, warp_per_block) based on runtime mode.
+
+        Default policy keys off the forward-context prefill/decode flag.
+        atom-vllm has no stable prefill/decode flag at this call site and
+        instead selects by a token-count threshold; it overrides this method
+        via a plugin patch, so keep this body frontend-agnostic.
+
+        block_num is capped at the device CU count: mori's IntraNode
+        dispatch/combine use a hand-rolled grid-wide barrier
+        (CrossDeviceBarrierIntraNodeKernel) that spins until *all* gridDim.x
+        blocks have arrived, which requires every block to be co-resident. The
+        combine block (1024 threads + larger dynamic smem) gets ~1 block/CU
+        occupancy, so launching more blocks than CUs (e.g. 128 on the 80-CU
+        MI308X) leaves the surplus blocks unscheduled -> the barrier never
+        completes -> warmup deadlocks. Capping at multi_processor_count keeps
+        big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
+        """
+        mp = get_cu_num()
+        context = get_forward_context().context
+        if context.is_prefill:
+            return min(128, mp), 16
+        return min(64, mp), 4
+
+    # ---- Synchronous (non-TBO) path ----
 
     def prepare(
         self,
@@ -92,18 +287,18 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
         scale = None
-        if self.use_fp8_dispatch:
+        if self.use_fp4_dispatch:
+            from aiter import get_hip_quant
+
+            quant_func = get_hip_quant(self.quant_type or quant_type)
+            a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
+        elif self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
-        context = get_forward_context().context
-        if context.is_prefill:
-            block_num = 128
-            warp_per_block = 16
-        else:
-            block_num = 64
-            warp_per_block = 4
+
+        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
 
         (
             dispatch_a1,
@@ -111,7 +306,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_scale,
             dispatch_ids,
             dispatch_recv_token_num,
-        ) = self.mori_op.dispatch(
+        ) = self._sync_mori_op.dispatch(
             a1, topk_weights, scale, topk_ids, block_num, warp_per_block
         )
 
@@ -134,22 +329,231 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
-        # weight_and_reduce_impl: mk.TopKWeightAndReduce,
-    ) -> None:
-        context = get_forward_context().context
-        if context.is_prefill:
-            block_num = 128
-            warp_per_block = 16
-        else:
-            block_num = 64
-            warp_per_block = 4
+    ) -> torch.Tensor:
+        num_token = topk_ids.shape[0]
 
-        num_token = output.shape[0]
-        result = self.mori_op.combine(
+        block_num, warp_per_block = self._get_dispatch_config(num_token)
+
+        result = self._sync_mori_op.combine(
             fused_expert_output,
             None,
             topk_ids,
             block_num,
             warp_per_block,
         )[0]
-        output.copy_(result[:num_token])
+        return result[:num_token]
+
+    # 1. IntraNode (default TBO): dispatch()/combine() on comm_stream
+    # 2. AsyncLL (--low-latency): dispatch_send/recv, combine_send/recv (CU-free)
+    def prepare_async(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+    ) -> mk.ReceiverType:
+        assert (
+            not apply_router_weight_on_input
+        ), "mori does not support apply_router_weight_on_input=True now."
+
+        scale = None
+        if self.use_fp4_dispatch:
+            from aiter import get_hip_quant
+
+            num_tokens = a1.shape[0]
+            if num_tokens > 0:
+                quant_func = get_hip_quant(self.quant_type or QuantType.per_1x32)
+                a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
+            else:
+                hidden_size = a1.shape[1] if a1.dim() > 1 else 0
+                a1 = torch.empty(a1.shape, dtype=dtypes.fp4x2, device=a1.device)
+                # per_1x32 emits e8m0 scales, one byte each -- must match the
+                # scale_type_size handed to MoRI in moe.py.
+                scale = torch.empty(
+                    (0, hidden_size // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=a1.device,
+                )
+        elif self.use_fp8_dispatch:
+            from aiter import get_hip_quant
+
+            num_tokens = a1.shape[0]
+            if num_tokens > 0:
+                quant_func = get_hip_quant(QuantType.per_1x128)
+                a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
+            else:
+                hidden_size = a1.shape[1] if a1.dim() > 1 else 0
+                a1 = torch.empty(a1.shape, dtype=dtypes.fp8, device=a1.device)
+                scale = torch.empty(
+                    (0, hidden_size // 128),
+                    dtype=torch.float32,
+                    device=a1.device,
+                )
+
+        if self._low_latency:
+            return self._prepare_async_ll(a1, topk_weights, topk_ids, scale)
+        return self._prepare_async_comm_stream(a1, topk_weights, topk_ids, scale)
+
+    def _prepare_async_ll(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        scale: torch.Tensor | None,
+    ) -> tuple[Callable, mk.ReceiverType]:
+        """AsyncLL path: dispatch_send (CU-free) → yield → dispatch_recv."""
+        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
+
+        (
+            dispatch_a1,
+            dispatch_weights,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_recv_token_num,
+        ) = mori_op.dispatch_send(a1, topk_weights, scale, topk_ids)
+
+        def hook():
+            mori_op.dispatch_recv()
+
+        def receiver() -> mk.PrepareResultType:
+            expert_tokens_meta = mk.ExpertTokensMetadata(
+                expert_num_tokens=dispatch_recv_token_num,
+                expert_num_tokens_cpu=None,
+            )
+            return (
+                dispatch_a1,
+                dispatch_scale,
+                expert_tokens_meta,
+                dispatch_ids,
+                dispatch_weights,
+            )
+
+        return (hook, receiver)
+
+    def _prepare_async_comm_stream(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        scale: torch.Tensor | None,
+    ) -> mk.ReceiverType:
+        from atom.utils.tbo.ubatching import (
+            tbo_current_ubatch_id,
+            tbo_switch_to_compute_sync,
+            tbo_yield_and_switch_from_compute_to_comm,
+        )
+
+        block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
+
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
+
+        tbo_yield_and_switch_from_compute_to_comm()
+
+        (
+            dispatch_a1,
+            dispatch_weights,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_recv_token_num,
+        ) = mori_op.dispatch(
+            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+        )
+
+        tbo_switch_to_compute_sync()
+
+        def receiver() -> mk.PrepareResultType:
+            expert_tokens_meta = mk.ExpertTokensMetadata(
+                expert_num_tokens=dispatch_recv_token_num,
+                expert_num_tokens_cpu=None,
+            )
+            return (
+                dispatch_a1,
+                dispatch_scale,
+                expert_tokens_meta,
+                dispatch_ids,
+                dispatch_weights,
+            )
+
+        return receiver
+
+    def finalize_async(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+    ) -> Callable:
+        num_token = topk_ids.shape[0]
+        if self._low_latency:
+            return self._finalize_async_ll(num_token, fused_expert_output, topk_ids)
+        return self._finalize_async_comm_stream(
+            num_token,
+            fused_expert_output,
+            topk_ids,
+        )
+
+    def _finalize_async_ll(
+        self,
+        num_token: int,
+        fused_expert_output: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[Callable, Callable]:
+        """AsyncLL path: combine_send (CU-free) → yield → combine_recv."""
+        from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
+
+        combined_hidden_states = mori_op.combine_send(
+            fused_expert_output, None, topk_ids
+        )
+
+        def hook():
+            mori_op.combine_recv()
+
+        def receiver():
+            return combined_hidden_states[0][:num_token]
+
+        return (hook, receiver)
+
+    def _finalize_async_comm_stream(
+        self,
+        num_token: int,
+        fused_expert_output: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> Callable:
+        from atom.utils.tbo.ubatching import (
+            tbo_current_ubatch_id,
+            tbo_switch_to_compute_sync,
+            tbo_yield_and_switch_from_compute_to_comm,
+        )
+
+        block_num, warp_per_block = self._get_dispatch_config(num_token)
+
+        ubatch_id = tbo_current_ubatch_id()
+        mori_op = self._tbo_mori_ops[ubatch_id]
+
+        # Yield to other thread FIRST, then switch to comm stream.
+        tbo_yield_and_switch_from_compute_to_comm()
+
+        result = mori_op.combine(
+            fused_expert_output,
+            None,
+            topk_ids,
+            block_num,
+            warp_per_block,
+        )[0]
+
+        tbo_switch_to_compute_sync()
+
+        def receiver():
+            return result[:num_token]
+
+        return receiver

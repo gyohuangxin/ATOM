@@ -1,37 +1,45 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import concurrent.futures
-import os
+import json
 import logging
-import re
-from glob import glob
-from typing import Generator, Tuple
+import os
+import time
 
 import safetensors
+import safetensors.torch
 import torch
 from torch import nn
-from tqdm import tqdm
 from transformers import AutoConfig
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from atom.model_loader.weight_utils import (
-    download_weights_from_hf,
-    filter_duplicate_safetensors_files,
-)
-from atom.models.deepseek_mtp import (
-    get_spec_layer_idx_from_weight_name,
-    rewrite_spec_layer_name,
-)
-from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.moe import (
-    FusedMoEMethodBase,
-    is_rocm_aiter_fusion_shared_expert_enabled,
-)
+# safetensors<=0.7.0 ships a Python `_TYPES` dict missing the `F8_E8M0`
+# (MX scale) entry, even though both torch and the safetensors-rust binary
+# support it. The mmap'd `safe_open` path goes through Rust and works, but
+# the `safetensors.torch.load(bytes)` path used when `ATOM_DISABLE_MMAP=true`
+# raises `KeyError: 'F8_E8M0'` on DeepSeek-V4-Pro shards. Register the
+# missing dtype string so both paths behave identically.
+if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"):
+    safetensors.torch._TYPES["F8_E8M0"] = torch.float8_e8m0fnu
+
 from aiter.dist.parallel_state import get_tp_group
-from atom.models.qwen3_next_mtp import remap_mtp_weight_name
 
+from atom.model_loader.loading_core import load_weights_into_model, rank_tag
+from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
+from atom.model_loader.weight_iterator import (
+    safetensors_weights_iterator,
+)
+
+# Re-exported so the many `from atom.model_loader.loader import WeightsMapper`
+# call sites (models, vLLM/SGLang/RTP-LLM plugins) keep working.
+from atom.model_loader.weight_names import WeightsMapper, WeightsMapping  # noqa: F401
+from atom.model_ops.base_config import QuantizeMethodBase
+from atom.model_ops.moe import FusedMoEMethodBase
+from atom.model_ops.topK import (
+    is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+)
 from atom.plugin.prepare import is_sglang
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -41,46 +49,26 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
     elif loaded_weight.numel() // get_tp_group().world_size == param.data.numel():
         loaded_weight_per_rank = loaded_weight.numel() // get_tp_group().world_size
-        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank
+        # Offset MUST use the TP-group-local rank (rank_in_group), NOT the global
+        # rank: `.world_size` above is the TP group size, so the two must be from
+        # the same (TP-group) frame. `.rank` is torch.distributed.get_rank()
+        # (global). They coincide only when world == tp (pure TP); under PCP/DP/PP
+        # the world splits into multiple TP groups, so a group's global ranks
+        # (e.g. PCP rank 1 = global 4..7) exceed its world_size (4), making this
+        # slice out of bounds → empty → copy_ fails.
+        tp_rank_start = loaded_weight_per_rank * get_tp_group().rank_in_group
         tp_rank_end = tp_rank_start + loaded_weight_per_rank
         param.data.copy_(loaded_weight.view(-1)[tp_rank_start:tp_rank_end])
-
-
-def safetensors_weights_iterator(
-    model_name_or_path: str,
-    disable_mmap: bool = False,
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
-    logger.info(f"disable_mmap: {disable_mmap}")
-    path = (
-        model_name_or_path
-        if os.path.isdir(model_name_or_path)
-        else download_weights_from_hf(
-            model_name_or_path, None, ["*.safetensors"], ignore_patterns=["original/*"]
+    else:
+        # Shape mismatch we cannot resolve — leaving the destination at its init
+        # value is almost always a bug. The post-load check in load_model() will
+        # catch this and warn (param will be in `unloaded` set since this loader
+        # never wrote to it). Raise here so the failure is loud at copy time
+        # too, instead of being masked by the default ones-init of RMSNorm etc.
+        raise RuntimeError(
+            f"default_weight_loader: shape mismatch — param={tuple(param.shape)} "
+            f"loaded={tuple(loaded_weight.shape)}. Cannot copy."
         )
-    )
-    hf_weights_files = filter_duplicate_safetensors_files(
-        glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
-    )
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
-
-    iters = tqdm(
-        hf_weights_files,
-        desc=f"Loading safetensors shards[{model_name_or_path}]",
-        disable=not enable_tqdm,
-    )
-    for st_file in iters:
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name, param in result.items():
-                    yield name, param
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    yield name, f.get_tensor(name)
 
 
 # when plugin mode, model loader method is bind to model implementation
@@ -90,6 +78,11 @@ def load_model_in_plugin_mode(
     model,
     config,
     prefix: str = "",
+    weights_mapper: WeightsMapper | None = None,
+    load_fused_expert_weights_fn=None,
+    spec_decode: bool = False,
+    hf_config_override: AutoConfig | None = None,
+    model_name_or_path_override: str | None = None,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -104,174 +97,273 @@ def load_model_in_plugin_mode(
     assert (
         config.plugin_config is not None and config.plugin_config.is_plugin_mode
     ), "ATOM is not running in plugin mode"
-    if config.plugin_config.is_vllm:
+    if model_name_or_path_override is not None:
+        model_name_or_path = model_name_or_path_override
+    elif config.plugin_config.is_vllm:
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path
+    elif config.plugin_config.is_rtpllm:
+        model_name_or_path = config.plugin_config.model_config.ckpt_path
 
     _empty_cache()
+    if hf_config_override is not None:
+        config_for_loading = getattr(
+            hf_config_override, "hf_config", hf_config_override
+        )
+        if hasattr(config_for_loading, "text_config"):
+            config_for_loading = config_for_loading.text_config
+    else:
+        config_for_loading = (
+            config.hf_config.text_config
+            if hasattr(config.hf_config, "text_config")
+            else config.hf_config
+        )
     loaded_weights_record = load_model(
         model=model,
         model_name_or_path=model_name_or_path,
-        hf_config=config.hf_config,
+        hf_config=config_for_loading,
         load_dummy=config.load_dummy,
-        spec_decode=False,
+        spec_decode=spec_decode,
         prefix=prefix,
         is_plugin_mode=True,
+        weights_mapper=weights_mapper,
+        load_fused_expert_weights_fn=load_fused_expert_weights_fn,
     )
     _empty_cache()
     return loaded_weights_record
+
+
+def _save_online_quant_info(
+    oq_layers: list[dict],
+    model_name_or_path: str,
+    elapsed_seconds: float,
+    online_quant_config: dict,
+    timing_scope: str,
+    peak_gpu_memory_gb: float | None,
+):
+    """Save online quantization info to a JSON file (rank 0 only)."""
+    if get_tp_group().rank_in_group != 0:
+        return
+    output_dir = envs.ATOM_TORCH_PROFILER_DIR or os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp_ns = time.time_ns() % 1_000_000_000
+    filepath = os.path.join(
+        output_dir, f"online_quant_info_{timestamp}_{timestamp_ns:09d}.json"
+    )
+
+    payload = {
+        "model": model_name_or_path,
+        "online_quant_config": online_quant_config,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "timing_scope": timing_scope,
+        "peak_gpu_memory_gb": (
+            round(peak_gpu_memory_gb, 3) if peak_gpu_memory_gb is not None else None
+        ),
+        "num_layers": len(oq_layers),
+        "layers": oq_layers,
+    }
+    with open(filepath, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    logger.info("Online quantization info saved to %s", filepath)
+
+
+# Dummy-weight init constants (see initialize_dummy_weights).
+_DUMMY_WEIGHT_STD = 2.0**-4  # ~0.0625, a plausible transformer weight magnitude
+_FP4_UNIT_BYTE = 0x22  # e2m1 fp4x2: both nibbles = 0b0010 = 1.0
+_E8M0_UNIT_CODE = 123  # e8m0 exponent code for 2^(123-127) = 2^-4 = _DUMMY_WEIGHT_STD
+
+
+def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
+    """Fill skipped-load (``--load_dummy``) params with finite values in place.
+
+    ``mode="zero"``   -> every param zeroed (works for fp4/fp8/int/bf16 alike).
+    ``mode="xavier"`` -> constant-magnitude init that keeps the forward finite and
+    roughly at real-weight scale:
+
+    - bf16/fp16/fp32 2D weight        -> ``xavier_uniform_``
+    - 1D norm weight (non-bias)        -> 1.0
+    - bias                             -> 0.0
+    - float weight_scale              -> ``_DUMMY_WEIGHT_STD``
+    - input_scale                      -> 1.0
+    - fp8 packed weight               -> 1.0
+    - fp4x2 packed weight (uint8-view) -> ``_FP4_UNIT_BYTE`` (each fp4 = 1.0)
+    - e8m0 (uint8) block scale        -> ``_E8M0_UNIT_CODE`` (= 2^-4)
+
+    Quantized weights are filled with a *constant* magnitude (not a true random
+    distribution), so the effective weights survive the shuffle/swizzle in each
+    quant method's ``process_weights_after_loading`` (a permutation of identical
+    bytes is a no-op). FP4 (MXFP4) is the validated path; FP8 and other formats
+    are made finite but not distribution-realistic.
+    """
+    for name, param in model.named_parameters():
+        data = param.data
+        if mode == "zero":
+            # zero_() is the fast path: valid for every shape and every
+            # standard dtype (fp8/int/bf16/...). Packed sub-byte dtypes
+            # (e.g. Float4_e2m1fn_x2) have no CUDA fill kernel, so zero_()
+            # raises ("fill_cuda" not implemented for that dtype); fall back
+            # to zeroing the raw bytes instead (all-zero bytes == zero-valued
+            # weights). Only packed weights reach the fallback, and those are
+            # contiguous and >=1D, so the uint8 view is always valid there.
+            try:
+                data.zero_()
+            except (NotImplementedError, RuntimeError):
+                data.view(torch.uint8).zero_()
+            continue
+        # mode == "xavier"
+        dt = data.dtype
+        if "input_scale" in name:
+            data.fill_(1.0)
+        elif "scale" in name:
+            if dt == torch.uint8:  # e8m0 block scale (fp4)
+                data.fill_(_E8M0_UNIT_CODE)
+            else:  # fp8/bf16 float scale
+                data.fill_(_DUMMY_WEIGHT_STD)
+        elif dt in (torch.float32, torch.float16, torch.bfloat16):
+            if data.dim() >= 2:
+                nn.init.xavier_uniform_(data)
+            elif "bias" in name:
+                data.zero_()
+            else:  # 1D norm weight etc.
+                data.fill_(1.0)
+        elif dt in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
+            data.fill_(1.0)  # fp8 packed weight
+        else:  # fp4x2 packed weight, viewable as uint8
+            data.view(torch.uint8).fill_(_FP4_UNIT_BYTE)
 
 
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
     hf_config: AutoConfig,
-    load_dummy: bool = False,
+    load_dummy: str | None = None,
     spec_decode: bool = False,
     prefix: str = "",
     is_plugin_mode: bool = False,
+    weights_mapper: WeightsMapper | None = None,
+    load_fused_expert_weights_fn=None,
 ):
-    def have_shared_expert(name):
-        maybe_matching_list = ["mlp.shared_experts.", "mlp.shared_expert."]
-        for maybe_matching_name in maybe_matching_list:
-            if maybe_matching_name in name:
-                return maybe_matching_name
-        return None
+    """Load a checkpoint into `model` and run post-load weight processing.
 
-    # need to record the loaded weight name for vllm load check
-    # it is only used in plugin mode for vllm
-    loaded_weights_record: set[str] = set()
+    The checkpoint -> parameter logic lives in `loading_core`, which is kept
+    free of AITER so it can be unit-tested without a GPU build; this wrapper
+    supplies the pieces that do need AITER (TP group, quant-config-driven
+    shared-expert fusion) and owns everything that happens after the weights
+    have landed.
 
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    weights_mapping = getattr(model, "weights_mapping", {})
-    params_dict = dict(model.named_parameters())
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        disable_mmap = os.environ.get("ATOM_DISABLE_MMAP", "false").lower() == "true"
-        for name, weight_tensor in safetensors_weights_iterator(
-            model_name_or_path, disable_mmap=disable_mmap
+    `is_plugin_mode` is unused and kept for call-site compatibility.
+    """
+
+    def _fuse_shared_expert(
+        shared_expert_prefix: str, routed_expert_prefix: str
+    ) -> bool:
+        model_quant_config = getattr(
+            getattr(model, "atom_config", None), "quant_config", None
+        )
+        if model_quant_config is None:
+            model_quant_config = getattr(model, "quant_config", None)
+        if model_quant_config is not None and hasattr(
+            model_quant_config, "get_layer_quant_config"
         ):
-            if load_dummy:
-                continue
-            if name.endswith("kv_scale") or "inv_freq" in name:
-                continue
-            if spec_decode:
-                if hf_config.model_type == "deepseek_mtp":
-                    spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
-                    if spec_layer is None:
-                        continue
-                    name = rewrite_spec_layer_name(spec_layer, name)
-                elif hf_config.model_type == "qwen3_next_mtp":
-                    remapped_name = remap_mtp_weight_name(name)
-                    if remapped_name is None:
-                        continue
-                    name = remapped_name
-            name_suffix = name.split(".")[-1]
-            if name_suffix in weights_mapping.keys():
-                name = name.replace(name_suffix, weights_mapping[name_suffix])
-            if "weight_scale_inv" in name:
-                name = name.replace("weight_scale_inv", "weight_scale")
+            return is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                model_quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=routed_expert_prefix,
+            )
+        return is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=shared_expert_prefix,
+            routed_expert_prefix=routed_expert_prefix,
+        )
 
-            layerId_ = re.search(r"model\.layers\.(\d+)\.", name)
-            layerId = int(layerId_.group(1)) if layerId_ else 0
-            if (
-                hf_config.num_hidden_layers
-                and layerId >= hf_config.num_hidden_layers
-                and not spec_decode
-            ):
-                continue
-            maybe_matching_name = have_shared_expert(name)
-            if (
-                is_rocm_aiter_fusion_shared_expert_enabled()
-                and maybe_matching_name is not None
-            ):
-                name = name.replace(
-                    maybe_matching_name,
-                    f"mlp.experts.{hf_config.n_routed_experts}.",
-                )
-            for k in packed_modules_mapping:
-                # We handle the experts below in expert_params_mapping
-                if "mlp.experts." in name and name not in params_dict:
-                    continue
-                if "mtp" in name and not spec_decode:
-                    continue
-                if k in name:
-                    v, shard_id = packed_modules_mapping[k]
-                    param_name = name.replace(k, v)
-                    # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
-                    if "output_scale" not in param_name:
-                        param = model.get_parameter(param_name)
-                        weight_loader = getattr(param, "weight_loader")
-                        # weight_loader(param, weight_tensor, shard_id)
-                        futures.append(
-                            executor.submit(
-                                weight_loader, param, weight_tensor, shard_id
-                            )
-                        )
-                        loaded_weights_record.add(prefix + param_name)
-                    break
-            else:
-                # Check if model has expert mapping before processing
-                if hasattr(model, "get_expert_mapping"):
-                    for k in model.get_expert_mapping():
-                        param_name, weight_name, expert_id, shard_id = k
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
-                        if (
-                            name.endswith(".bias") or name.endswith("_bias")
-                        ) and name not in dict(model.named_parameters()):
-                            continue
-                        if "mtp" in name and not spec_decode:
-                            continue
-                        param = model.get_parameter(name)
-                        weight_loader = getattr(param, "weight_loader")
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
-                                param,
-                                weight_tensor,
-                                name,
-                                shard_id,
-                                expert_id,
-                            )
-                        )
-                        loaded_weights_record.add(prefix + name)
-                        # weight_loader(
-                        #     param,
-                        #     weight_tensor,
-                        #     name,
-                        #     shard_id=shard_id,
-                        #     expert_id=expert_id,
-                        # )
-                        break
-                    else:
-                        if "mtp" in name and not spec_decode:
-                            continue
-                        param = model.get_parameter(name)
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        futures.append(
-                            executor.submit(weight_loader, param, weight_tensor)
-                        )
-                        loaded_weights_record.add(prefix + name)
-                        # weight_loader(param, weight_tensor)
-                else:
-                    # Model doesn't have expert mapping, use generic loading
-                    param = model.get_parameter(name)
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    # weight_loader(param, weight_tensor)
-                    futures.append(executor.submit(weight_loader, param, weight_tensor))
-                    loaded_weights_record.add(prefix + name)
-        # Wait for all tasks to complete and raise any exceptions.
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
-    for _, module in model.named_modules():
-        if hasattr(module, "process_weights_after_loading"):
+    def _is_rank0() -> bool:
+        # Diagnostics must not be the thing that breaks loading, and the TP
+        # group may not exist yet (single-process tools, plugin hosts), so any
+        # failure here degrades to "report from this rank".
+        try:
+            return get_tp_group().rank == 0
+        except Exception:  # noqa: BLE001
+            return True
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Quantize eligible modules as soon as their source weights complete.
+    # This must also run for speculative draft loads: those modules were built
+    # with the same meta-backed streaming parameters as the target. `spec_decode`
+    # only changes checkpoint-name selection; it must not disable materialization.
+    online_quant_streamer = OnlineQuantStreamer.maybe_create(model, load_dummy)
+
+    loaded_weights_record = load_weights_into_model(
+        model=model,
+        model_name_or_path=model_name_or_path,
+        hf_config=hf_config,
+        load_dummy=load_dummy,
+        spec_decode=spec_decode,
+        prefix=prefix,
+        weights_mapper=weights_mapper,
+        load_fused_expert_weights_fn=load_fused_expert_weights_fn,
+        default_weight_loader=default_weight_loader,
+        fuse_shared_expert=_fuse_shared_expert,
+        is_rank0=_is_rank0,
+        weights_iterator=safetensors_weights_iterator,
+        online_quant_streamer=online_quant_streamer,
+    )
+
+    # Dummy modes other than "empty" fill the skipped-load params with finite
+    # values before post-processing, so shuffle/swizzle runs on clean constants.
+    if load_dummy and load_dummy != "empty":
+        initialize_dummy_weights(model, load_dummy)
+
+    if online_quant_streamer is not None:
+        online_quant_streamer.replay_stragglers_and_report(_is_rank0())
+
+    has_online_quant = any(
+        getattr(m, "online_quant", False)
+        or (
+            getattr(m, "quant_config", None) is not None
+            and getattr(m.quant_config, "online_quant", False)
+        )
+        for _, m in model.named_modules()
+    )
+    streamed_done = (
+        online_quant_streamer.done_module_ids
+        if online_quant_streamer is not None
+        else frozenset()
+    )
+    stream_candidate_count = (
+        len(online_quant_streamer.candidates)
+        if online_quant_streamer is not None
+        else 0
+    )
+    stream_fallback_count = stream_candidate_count - len(streamed_done)
+    if online_quant_streamer is not None:
+        logger.info(
+            "[%s] Streaming online quantization: %d/%d eligible modules were "
+            "quantized while loading; the post-load pass remains enabled to "
+            "quantize %d fallback module(s) and finish weight processing",
+            rank_tag(),
+            len(streamed_done),
+            stream_candidate_count,
+            stream_fallback_count,
+        )
+    elif has_online_quant:
+        logger.info(
+            "[%s] Post-load online quantization and weight processing started",
+            rank_tag(),
+        )
+    pp_start = time.perf_counter()
+
+    # Parent-first traversal is significant for streaming-deferred children:
+    # their parent first combines source weights, then the child's normal hook
+    # online-quantizes the final fused weight.
+    for module_name, module in model.named_modules():
+        # Avoid repeating module post-processing already run by the streamer.
+        if (
+            hasattr(module, "process_weights_after_loading")
+            and id(module) not in streamed_done
+        ):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
 
@@ -282,5 +374,94 @@ def load_model(
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
 
-    if is_plugin_mode:
-        return loaded_weights_record
+        # Online quantization creates new params (e.g. weight_scale) that are
+        # not present in the source checkpoint. Record them as "loaded" so the
+        # plugin host's strict weight tracking (e.g. vLLM's default loader)
+        # does not flag them as uninitialized.
+        if getattr(module, "_online_quant_info", None) is not None:
+            for param_name, _ in module.named_parameters(recurse=False):
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
+                loaded_weights_record.add(prefix + full_name)
+
+    # Post-processing (AITER shuffle/swizzle, per-quant-method hooks) runs inside
+    # the load time the caller reports, so it is timed unconditionally: without
+    # this line a shuffle-dominated load is indistinguishable from a slow read.
+    pp_elapsed = time.perf_counter() - pp_start
+    peak_gpu_memory_gb = (
+        torch.cuda.max_memory_allocated() / (1 << 30)
+        if torch.cuda.is_available()
+        else None
+    )
+    if not has_online_quant:
+        logger.info(
+            "[%s] Weight post-processing done: %.2f seconds",
+            rank_tag(),
+            pp_elapsed,
+        )
+    else:
+        oq_layers = []
+        raw_online_quant_config = None
+        for _, module in model.named_modules():
+            info = getattr(module, "_online_quant_info", None)
+            if info is not None:
+                oq_layers.append(info)
+            if raw_online_quant_config is None:
+                qc = getattr(module, "quant_config", None)
+                if qc is not None and hasattr(qc, "online_quant_config_raw"):
+                    raw_online_quant_config = qc.online_quant_config_raw
+        if online_quant_streamer is not None:
+            logger.info(
+                "[%s] Post-stream fallback and weight processing done: %.2f "
+                "seconds; %d module(s) quantized while loading, %d fallback "
+                "module(s) quantized after loading, %d layers online-quantized "
+                "in total",
+                rank_tag(),
+                pp_elapsed,
+                len(streamed_done),
+                stream_fallback_count,
+                len(oq_layers),
+            )
+            timing_scope = "post_stream_fallback_and_weight_processing"
+        else:
+            logger.info(
+                "[%s] Post-load online quantization and weight processing done: "
+                "%.2f seconds, %d layers online-quantized",
+                rank_tag(),
+                pp_elapsed,
+                len(oq_layers),
+            )
+            timing_scope = "post_load_online_quantization_and_weight_processing"
+        _save_online_quant_info(
+            oq_layers,
+            model_name_or_path,
+            pp_elapsed,
+            raw_online_quant_config or {},
+            timing_scope,
+            peak_gpu_memory_gb,
+        )
+
+    # Measure both loading and post-processing for comparable peak memory.
+    if peak_gpu_memory_gb is not None:
+        if online_quant_streamer is not None:
+            logger.info(
+                "[%s] Peak GPU memory during streaming weight loading and "
+                "online quantization: %.2f GB",
+                rank_tag(),
+                peak_gpu_memory_gb,
+            )
+        elif has_online_quant:
+            logger.info(
+                "[%s] Peak GPU memory during weight loading and post-load "
+                "online quantization: %.2f GB",
+                rank_tag(),
+                peak_gpu_memory_gb,
+            )
+        else:
+            logger.info(
+                "[%s] Peak GPU memory during weight loading and "
+                "post-processing: %.2f GB",
+                rank_tag(),
+                peak_gpu_memory_gb,
+            )
+
+    return loaded_weights_record

@@ -21,8 +21,12 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from aiter import ActivationType
-from aiter.dist.communication_op import tensor_model_parallel_all_gather
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 
 # from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -35,6 +39,9 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
+
+from atom.utils import envs
 
 # from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from atom.models.utils import (
@@ -46,6 +53,8 @@ from atom.models.utils import (
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import GptOssConfig
+
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
 
 def cdiv(x, y):
@@ -71,12 +80,6 @@ class OAIAttention(nn.Module):
         rope_params = config.rope_parameters
         rope_theta = rope_params["rope_theta"]
 
-        if rope_params is None:
-            raise ValueError(
-                "GPT-OSS config is missing RoPE scaling parameters. Expected either "
-                "`rope_scaling` (transformers < 5) or `rope_parameters` (transformers 5+)."
-            )
-
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -89,9 +92,7 @@ class OAIAttention(nn.Module):
 
         tp_size = get_tensor_model_parallel_world_size()
 
-        self.sinks = torch.nn.Parameter(
-            torch.empty(config.num_attention_heads // tp_size, requires_grad=False)
-        )
+        self.sinks = atom_parameter(torch.empty(config.num_attention_heads // tp_size))
 
         self.q_size = self.num_attention_heads * self.head_dim // tp_size
         self.kv_size = self.num_key_value_heads * self.head_dim // tp_size
@@ -103,7 +104,7 @@ class OAIAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.num_attention_heads,
             total_num_kv_heads=self.num_key_value_heads,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             bias=True,
         )
@@ -111,9 +112,10 @@ class OAIAttention(nn.Module):
         self.o_proj = RowParallelLinear(
             input_size=self.num_attention_heads * self.head_dim,
             output_size=self.hidden_size,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             bias=True,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
         self.num_local_attention_heads = config.num_attention_heads // tp_size
@@ -141,9 +143,45 @@ class OAIAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         # q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, positions)
+        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
+            )
+        else:
+            attn_output = self.attn(q, k, v, positions)
         output = self.o_proj(attn_output)
         return output
+
+
+def _interleave_swiglu_weights(experts: FusedMoE):
+    """Interleave gate/up weights, scales, and biases for Swiglu activation.
+
+    Must run before Mxfp4MoEMethod.process_weights_after_loading (shuffle).
+    The loader calls module.process_weights_after_loading() before
+    quant_method.process_weights_after_loading(module), so this ordering
+    is guaranteed.
+    """
+    e, n, k = experts.w13_weight.shape
+    experts.w13_weight.view(torch.uint8).copy_(
+        experts.w13_weight.data.view(torch.uint8)
+        .view(e, n // 2, 2, k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(e, n, k)
+    )
+    experts.w13_weight_scale.data = (
+        experts.w13_weight_scale.data.view(e, n // 2, 2, -1)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(e, n, -1)
+    )
+    if experts.w13_bias is not None:
+        experts.w13_bias.data = (
+            experts.w13_bias.data.view(-1, n // 2, 2)
+            .permute(0, 2, 1)
+            .contiguous()
+            .view(-1, n)
+        )
 
 
 class MLPBlock(torch.nn.Module):
@@ -163,6 +201,7 @@ class MLPBlock(torch.nn.Module):
         self.hidden_size = config.hidden_size
         self.experts_per_token = config.num_experts_per_tok
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.router = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
@@ -176,7 +215,7 @@ class MLPBlock(torch.nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            reduce_results=True,
+            reduce_results=False,
             renormalize=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -185,12 +224,37 @@ class MLPBlock(torch.nn.Module):
             activation=ActivationType.Swiglu,
             config=config,
         )
+        # Detect MXFP4 MoE GEMM padding requirement from the quant method.
+        # When hidden_size is not aligned to 256, MXFP4 weights are padded
+        # and the kernel expects padded input. We handle padding here instead
+        # of in the layernorm, so the layernorm can use fused AllReduce.
+        if hasattr(self.experts.quant_method, "hidden_pad"):
+            self.moe_hidden_pad = self.experts.quant_method.hidden_pad
+        else:
+            self.moe_hidden_pad = 0
+
+    def process_weights_after_loading(self):
+        if getattr(self.experts.quant_method, "use_triton", False):
+            return
+        _interleave_swiglu_weights(self.experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
 
         g = self.router(x[..., : self.hidden_size])
+
+        # Pad input for MXFP4 MoE GEMM alignment if needed
+        if self.moe_hidden_pad > 0 and self.tp_size > 1:
+            x = F.pad(x, (0, self.moe_hidden_pad))
+
         x = self.experts(hidden_states=x, router_logits=g)
+
+        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+            x = tensor_model_parallel_all_reduce(x)
+
+        # Remove padding from output
+        if self.moe_hidden_pad > 0:
+            x = x[:, : self.hidden_size]
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
@@ -213,6 +277,7 @@ class TransformerBlock(torch.nn.Module):
 
         self.layer_idx = layer_num
         self.hidden_size = atom_config.hf_config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.self_attn = OAIAttention(
             config,
             prefix=f"{prefix}.self_attn",
@@ -221,9 +286,23 @@ class TransformerBlock(torch.nn.Module):
             layer_num=layer_num,
         )
         self.mlp = MLPBlock(atom_config, self.layer_idx, prefix=f"{prefix}.mlp")
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
+        # Fuse MoE AllReduce into input_layernorm for layers > 0.
+        # Layer 0 receives already-reduced embedding output, so no fusion needed.
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=1e-5,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
+            prefix=f"{prefix}.input_layernorm",
+        )
+        # Fuse o_proj AllReduce into post_attention_layernorm.
+        # Padding for MXFP4 MoE GEMM alignment is now handled inside MLPBlock,
+        # so this layernorm no longer needs x_pad_to_multiple.
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=1e-5, x_pad_to_multiple=256
+            config.hidden_size,
+            eps=1e-5,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1,
+            x_pad_to_multiple=0 if self.tp_size > 1 else 256,
+            prefix=f"{prefix}.post_attention_layernorm",
         )
 
     def forward(
@@ -238,11 +317,12 @@ class TransformerBlock(torch.nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(hidden_states, positions)
 
-        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        output = self.mlp(hidden_states)[:, : self.hidden_size]
+
+        output = self.mlp(hidden_states)
         return output, residual
 
 
@@ -258,11 +338,18 @@ class GptOssModel(nn.Module):
         self.config = atom_config.hf_config
         self.quant_config = atom_config.quant_config
         self.config.hidden_size = self.config.hidden_size
-        self.embedding = VocabParallelEmbedding(
+        # Register `embed_tokens` first so it stays the primary (non-deduped)
+        # name reported by `named_parameters()`. The checkpoint stores this
+        # tensor as `model.embed_tokens.weight`; if `embedding` were the primary
+        # name instead, the load-completeness check would falsely flag
+        # `model.embedding.weight` as unloaded (the weight is in fact loaded via
+        # the shared-storage alias). `embedding` remains as an alias for the
+        # internal call sites below.
+        self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
             self.config.hidden_size,
         )
-        self.embed_tokens = self.embedding
+        self.embedding = self.embed_tokens
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
             lambda prefix, layer_num=None: TransformerBlock(
@@ -273,7 +360,12 @@ class GptOssModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
+        self.norm = RMSNorm(
+            self.config.hidden_size,
+            eps=1e-5,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.norm" if prefix else "norm",
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )
@@ -327,13 +419,20 @@ class GptOssForCausalLM(nn.Module):
         "gate_up_proj_blocks": "w13_weight",
         "down_proj_blocks": "w2_weight",
         "gate_up_proj_scales": "w13_weight_scale",
+        "gate_up_proj_input_scale": "w13_input_scale",
         "down_proj_scales": "w2_weight_scale",
-        # MoE other weights
-        "gate_up_proj": "w13_weight",
-        "down_proj": "w2_weight",
-        # MoE Bias
+        "down_proj_input_scale": "w2_input_scale",
         "gate_up_proj_bias": "w13_bias",
         "down_proj_bias": "w2_bias",
+        # Quark weights
+        ".gate_up_proj.weight": ".w13_weight",
+        ".gate_up_proj.weight_scale": ".w13_weight_scale",
+        ".gate_up_proj.input_scale": ".w13_input_scale",
+        ".gate_up_proj.bias": ".w13_bias",
+        ".down_proj.weight": ".w2_weight",
+        ".down_proj.weight_scale": ".w2_weight_scale",
+        ".down_proj.input_scale": ".w2_input_scale",
+        ".down_proj.bias": ".w2_bias",
     }
 
     def __init__(

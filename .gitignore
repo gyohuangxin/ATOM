@@ -45,7 +45,16 @@ __pycache__
 # editor
 .vscode
 
+# claude local settings (personal permissions, not for repo)
+.claude/settings.local.json
+
 # debug folder
 debug
 aiter_logs
 *.log
+online_quant_info_*.json
+.claude/plan/
+
+# CI: Docker / BuildKit state under workspace (self-hosted CI)
+.atom-docker-client/
+.buildkit-tmp/

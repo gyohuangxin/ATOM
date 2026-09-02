@@ -2,28 +2,128 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # from flash_attn import flash_attn_with_kvcache
-from typing import Optional
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
-from torch import nn
 import triton
 import triton.language as tl
+from torch import nn
 
-
-from atom.utils import mark_spliting_op
-from .attention_mla import MLAModules
 from atom.config import get_current_atom_config
+from atom.utils import mark_spliting_op
 from atom.utils.selector import get_attn_backend
+
+from .attention_mla import MLAModules, _mla_output_width
 
 
 # frontend interface class for constructing attention
 # op in model file
 class Attention:
     def __new__(cls, *args, **kwargs):
-        from atom.model_ops import Attention
+        from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
-        return Attention(*args, **kwargs)
+        if is_vllm():
+            from atom.plugin.vllm.attention.layer import AttentionForVllm
+
+            return AttentionForVllm(*args, **kwargs)
+        if is_sglang():
+            from atom.plugin.sglang.attention import AttentionForSGLang
+
+            return AttentionForSGLang(*args, **kwargs)
+        if is_rtpllm():
+            from atom.plugin.rtpllm.attention_backend import AttentionForRTPLLM
+
+            return AttentionForRTPLLM(*args, **kwargs)
+
+        from atom.model_ops.paged_attention import Attention as AttentionForAtom
+
+        return AttentionForAtom(*args, **kwargs)
+
+
+def run_pa_fwd_asm(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_qlen: int = 1,
+    high_precision: int = 0,
+):
+    """Run the AITER paged-attention ASM kernel with explicit metadata."""
+
+    import aiter
+
+    return aiter.pa_fwd_asm(
+        Q=q,
+        K=k_cache,
+        V=v_cache,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_tables_stride0=block_tables.stride(0),
+        max_qlen=max_qlen,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=out,
+        qo_indptr=qo_indptr,
+        high_precision=high_precision,
+    )
+
+
+def run_pa_decode_gluon(
+    output: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    max_seqlen_q: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
+    compute_type: torch.dtype,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+    *,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    temporary_output: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sliding_window: int = -1,
+    ps: bool = True,
+):
+    """Run the AITER paged-attention Gluon decode kernel."""
+
+    return torch.ops.aiter.pa_decode_gluon(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        context_lens,
+        block_tables,
+        softmax_scale,
+        max_seqlen_q,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        q_scale,
+        k_scale,
+        v_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        ps=ps,
+    )
 
 
 # this triton kernel is used to fetch the stored kv in
@@ -41,18 +141,24 @@ def cp_mha_gather_cache_kernel(
     seq_start_ptr,  # [num_batches]
     k_scale_ptr,  # [1] / [num_blocks, num_kv_heads, page_size]
     v_scale_ptr,
+    k_cache_stride0,
+    v_cache_stride0,
     num_heads,
     head_size,
     x,
     max_block_num,
     DEQUANT: tl.constexpr,
+    PER_TOKEN_QUANT: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     CACHE_FORMAT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     head_id = tl.program_id(1)
+    # BLOCK_SIZE is rounded up to next pow2 at the call site (tl.arange requires
+    # pow2); col_mask guards stores/loads when head_size is non-pow2 (e.g. MiMo SWA=192).
     col_offsets = tl.arange(0, BLOCK_SIZE)
+    col_mask = col_offsets < head_size
 
     key_ptr_offset = key_ptr + token_id * head_size * num_heads + head_id * head_size
     value_ptr_offset = (
@@ -74,27 +180,33 @@ def cp_mha_gather_cache_kernel(
         # V: [num_blocks, page_size, num_head, head_dim]
         key_cache_ptr_offset = (
             key_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * k_cache_stride0
             + slot_id * num_heads * head_size
             + head_id * head_size
         )
         value_cache_ptr_offset = (
             value_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * v_cache_stride0
             + slot_id * num_heads * head_size
             + head_id * head_size
         )
-        k_reg = tl.load(key_cache_ptr_offset + col_offsets)
-        v_reg = tl.load(value_cache_ptr_offset + col_offsets)
+        k_reg = tl.load(key_cache_ptr_offset + col_offsets, mask=col_mask)
+        v_reg = tl.load(value_cache_ptr_offset + col_offsets, mask=col_mask)
         if DEQUANT:
-            k_scale = tl.load(k_scale_ptr)
-            v_scale = tl.load(v_scale_ptr)
-            k_dtype = k_reg.dtype
-            v_dtype = v_reg.dtype
-            k_reg = (k_reg.to(tl.float32) * k_scale).to(k_dtype)
-            v_reg = (v_reg.to(tl.float32) * v_scale).to(v_dtype)
-        tl.store(key_ptr_offset + col_offsets, k_reg)
-        tl.store(value_ptr_offset + col_offsets, v_reg)
+            if PER_TOKEN_QUANT:
+                scale_offset = (
+                    block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+                )
+                k_scale = tl.load(k_scale_ptr + scale_offset)
+                v_scale = tl.load(v_scale_ptr + scale_offset)
+            else:
+                # per-tensor: one scale per ptr, no offset
+                k_scale = tl.load(k_scale_ptr)
+                v_scale = tl.load(v_scale_ptr)
+            k_reg = k_reg.to(tl.float32) * k_scale
+            v_reg = v_reg.to(tl.float32) * v_scale
+        tl.store(key_ptr_offset + col_offsets, k_reg, mask=col_mask)
+        tl.store(value_ptr_offset + col_offsets, v_reg, mask=col_mask)
 
     elif CACHE_FORMAT == "SHUFFLE":
         # for kv cache layout as
@@ -102,28 +214,36 @@ def cp_mha_gather_cache_kernel(
         # V: [num_blocks, num_head, page_size // x, head_dim, x]
         key_cache_ptr_offset = (
             key_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * k_cache_stride0
             + head_id * head_size * PAGE_SIZE
             + slot_id * x
         )
         value_cache_ptr_offset = (
             value_cache_ptr
-            + block_id * num_heads * head_size * PAGE_SIZE
+            + block_id * v_cache_stride0
             + head_id * head_size * PAGE_SIZE
             + (slot_id // x) * head_size * x
             + slot_id % x
         )
         k_reg_offset = col_offsets // x * PAGE_SIZE * x + col_offsets % x
         v_reg_offset = col_offsets * x
-        k_reg = tl.load(key_cache_ptr_offset + k_reg_offset)
-        v_reg = tl.load(value_cache_ptr_offset + v_reg_offset)
+        k_reg = tl.load(key_cache_ptr_offset + k_reg_offset, mask=col_mask)
+        v_reg = tl.load(value_cache_ptr_offset + v_reg_offset, mask=col_mask)
         if DEQUANT:
-            k_scale = 1.0
-            v_scale = 1.0
+            if PER_TOKEN_QUANT:
+                scale_offset = (
+                    block_id * num_heads * PAGE_SIZE + head_id * PAGE_SIZE + slot_id
+                )
+                k_scale = tl.load(k_scale_ptr + scale_offset)
+                v_scale = tl.load(v_scale_ptr + scale_offset)
+            else:
+                # per-tensor: one scale per ptr, no offset
+                k_scale = tl.load(k_scale_ptr)
+                v_scale = tl.load(v_scale_ptr)
             k_reg = k_reg.to(tl.float32) * k_scale
             v_reg = v_reg.to(tl.float32) * v_scale
-        tl.store(key_ptr_offset + col_offsets, k_reg)
-        tl.store(value_ptr_offset + col_offsets, v_reg)
+        tl.store(key_ptr_offset + col_offsets, k_reg, mask=col_mask)
+        tl.store(value_ptr_offset + col_offsets, v_reg, mask=col_mask)
 
 
 def cp_mha_gather_cache(
@@ -140,6 +260,7 @@ def cp_mha_gather_cache(
     dequant: bool,
     kv_cache_layout: str,
     total_tokens: int,
+    per_token_quant: bool = True,
 ):
     assert kv_cache_layout in [
         "NHD",
@@ -147,16 +268,30 @@ def cp_mha_gather_cache(
     ], "kv_cache_layout only support NHD, SHUFFLE"
     if dequant:
         assert k_scales is not None and v_scales is not None
+        if k_scales.numel() == 1 and v_scales.numel() == 1:
+            per_token_quant = False
+        else:
+            assert (
+                k_scales.numel() > 1 and v_scales.numel() > 1
+            ), "k_scales and v_scales must both be scalar or per-token"
+
     head_dim = key.shape[2]
     x = 16 // key_cache.element_size()
-    # For k cache layout: [num_blocks, num_heads, page_size, head_dim]
-    assert head_dim == key_cache.shape[3], (
-        "We assume your kv cache layout is [num_blocks, "
-        "page_size, num_heads, head_dim], but got otherwise"
-    )
-    page_size = key_cache.shape[1]
-    num_heads = key_cache.shape[2]
+    if kv_cache_layout == "NHD":
+        # K: [num_blocks, page_size, num_heads, head_dim]
+        assert head_dim == key_cache.shape[3]
+        page_size = key_cache.shape[1]
+        num_heads = key_cache.shape[2]
+    else:
+        # SHUFFLE: K [num_blocks, num_heads, head_dim//x, page_size, x]
+        assert (
+            key_cache.dim() == 5 and head_dim == key_cache.shape[2] * key_cache.shape[4]
+        )
+        page_size = key_cache.shape[3]
+        num_heads = key_cache.shape[1]
 
+    k_cache_stride0 = key_cache.stride(0)
+    v_cache_stride0 = value_cache.stride(0)
     grid = lambda meta: (total_tokens, num_heads)  # noqa: E731
     cp_mha_gather_cache_kernel[grid](
         key_cache,
@@ -169,14 +304,17 @@ def cp_mha_gather_cache(
         seq_starts,
         k_scales,
         v_scales,
+        k_cache_stride0,
+        v_cache_stride0,
         num_heads,
         head_dim,
         x,
         block_tables.size(1),
         DEQUANT=dequant,
+        PER_TOKEN_QUANT=per_token_quant,
         PAGE_SIZE=page_size,
         CACHE_FORMAT=kv_cache_layout,
-        BLOCK_SIZE=head_dim,
+        BLOCK_SIZE=triton.next_power_of_2(head_dim),
     )
 
 
@@ -191,10 +329,12 @@ def fake_(
     qkv: torch.Tensor,
 ) -> torch.Tensor:
     output_shape = list(q.shape)
-    if use_mla:
-        output_shape[-1] = 7168
     # If we fusion rmsnorm and quant, the input dtype is fp8, but actually we use bf16 for output.
     atom_config = get_current_atom_config()
+    if use_mla:
+        bound = atom_config.compilation_config.static_forward_context[layer_name]
+        impl = getattr(bound, "impl", bound)
+        output_shape[-1] = _mla_output_width(impl, atom_config.hf_config.hidden_size)
     output_dtype = atom_config.torch_dtype
     output = torch.zeros(output_shape, dtype=output_dtype, device=q.device)
 
@@ -218,10 +358,15 @@ def unified_attention_with_output_base(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
-        return self.impl.forward(q, k, v, positions, q_scale, qkv)
+        return self.impl.forward(
+            query=q,
+            k_nope=k,
+            k_rope=v,
+            positions=positions,
+            q_scale=q_scale,
+        )
     else:
         return self.impl.forward(
-            layer=self,
             query=q,
             key=k,
             value=v,
@@ -238,11 +383,13 @@ def linear_attention_with_output_base_fake(
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    return core_attn_out
+    return torch.empty_like(core_attn_out)
 
 
 @mark_spliting_op(
-    is_custom=True, gen_fake=linear_attention_with_output_base_fake, mutates_args=[]
+    is_custom=True,
+    gen_fake=linear_attention_with_output_base_fake,
+    mutates_args=[],
 )
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
@@ -253,7 +400,9 @@ def linear_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(mixed_qkv, b, a, core_attn_out)
+    ret = torch.empty_like(core_attn_out)
+    ret = self.impl.forward(mixed_qkv, b, a, ret, layer_name)
+    return ret
 
 
 class BaseAttention(nn.Module, ABC):
@@ -328,6 +477,7 @@ class LinearAttention(nn.Module):
         self.activation = activation
         self.layer_num = layer_num
         self.base_linear_attention = None
+        self.prefix = prefix
 
         atom_config = get_current_atom_config()
         block_size = atom_config.kv_cache_block_size

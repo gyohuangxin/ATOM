@@ -17,13 +17,16 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.model_ops.topK import (
     is_rocm_aiter_fuse_routed_scaling_factor,
     is_rocm_aiter_fusion_shared_expert_enabled,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
+from typing import Any
 
 from .utils import (
     IntermediateTensors,
@@ -31,6 +34,11 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+)
+
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
 
 
@@ -105,8 +113,14 @@ class Glm4MoE(nn.Module):
             bias=False,
             dtype=torch.float32,
         )
-        self.gate.e_score_correction_bias = nn.Parameter(
+        self.gate.e_score_correction_bias = atom_parameter(
             torch.empty(config.n_routed_experts, dtype=torch.float32)
+        )
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
         )
 
         self.n_redundant_experts = 0
@@ -120,7 +134,7 @@ class Glm4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 # Only create separate shared_experts module when fusion is disabled
                 intermediate_size = (
                     config.moe_intermediate_size * config.n_shared_experts
@@ -152,7 +166,9 @@ class Glm4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func="sigmoid",
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            has_bias=getattr(config, "moe_ffn_bias", False),
             config=config,
+            shared_expert_prefix=f"{prefix}.shared_experts",
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -163,7 +179,7 @@ class Glm4MoE(nn.Module):
         router_logits = self.gate(hidden_states.to(dtype=torch.float32))
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
         final_hidden_states = self.experts(
@@ -175,11 +191,11 @@ class Glm4MoE(nn.Module):
 
         if (
             self.shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -197,7 +213,7 @@ class Glm4MoeAttention(nn.Module):
         qkv_bias: bool = False,
         use_qk_norm: bool = False,
         cache_config: str = "bf16",
-        quant_config: QuantizationConfig | None = None,
+        atom_config: Config | None = None,
         prefix: str = "",
         rope_theta: float = 10000,
         layer_num: int = 0,
@@ -224,6 +240,9 @@ class Glm4MoeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.use_qk_norm = use_qk_norm
+        self.enable_qk_norm_rope_cache_quant_fusion = (
+            self.use_qk_norm and ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -231,7 +250,7 @@ class Glm4MoeAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
 
@@ -239,54 +258,73 @@ class Glm4MoeAttention(nn.Module):
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=atom_config.quant_config,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             prefix=f"{prefix}.o_proj",
         )
 
-        # config.rope_parameters.setdefault("partial_rotary_factor", 0.5)
-        partial_rotary_factor = 0.5
+        rope_parameters = dict(getattr(config, "rope_parameters", None) or {})
+        rope_parameters.setdefault("partial_rotary_factor", 0.5)
+        partial_rotary_factor = rope_parameters["partial_rotary_factor"]
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=rotary_dim,
             base=rope_theta,
             max_position=max_position_embeddings,
-            # rope_parameters=config.rope_parameters,
-            partial_rotary_factor=partial_rotary_factor,
+            rope_scaling=rope_parameters,
         )
+        if self.enable_qk_norm_rope_cache_quant_fusion:
+            cos = self.rotary_emb.cos_cache
+            sin = self.rotary_emb.sin_cache
+            joint_cache = torch.cat((cos, sin), dim=-1)
+            self.rotary_emb.register_buffer(
+                "cos_sin_cache",
+                joint_cache.view(joint_cache.size(0), -1).contiguous(),
+                persistent=False,
+            )
+        self.q_norm = None
+        self.k_norm = None
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             kv_cache_dtype=cache_config,
-            quant_config=quant_config,
+            config=atom_config,
             prefix=f"{prefix}.attn",
             layer_num=layer_num,
             use_mla=False,
             rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm if self.enable_qk_norm_rope_cache_quant_fusion else None,
+            k_norm=self.k_norm if self.enable_qk_norm_rope_cache_quant_fusion else None,
         )
-
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        **model_kwargs: dict[str, Any] | None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
-                q.shape
+        if self.enable_qk_norm_rope_cache_quant_fusion:
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
             )
-            k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(
-                k.shape
-            )
+        else:
+            if self.use_qk_norm:
+                q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(
+                    q.shape
+                )
+                k = self.k_norm(
+                    k.reshape(-1, self.num_kv_heads, self.head_dim)
+                ).reshape(k.shape)
 
-        # q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, positions)
+            attn_output = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(attn_output)
         return output
 
@@ -295,8 +333,7 @@ class Glm4MoeDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Glm4MoeConfig,
-        cache_config: str = "bf16",
-        quant_config: QuantizationConfig | None = None,
+        atom_config: Config | None = None,
         prefix: str = "",
         layer_num: int = 0,
         enable_eplb: bool = False,
@@ -320,8 +357,8 @@ class Glm4MoeDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=config.attention_bias,
-            cache_config=cache_config,
-            quant_config=quant_config,
+            cache_config=atom_config.kv_cache_dtype,
+            atom_config=atom_config,
             prefix=f"{prefix}.self_attn",
             use_qk_norm=config.use_qk_norm,
             rope_theta=rope_theta,
@@ -334,7 +371,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         ):
             self.mlp = Glm4MoE(
                 config=config,
-                quant_config=quant_config,
+                quant_config=atom_config.quant_config,
                 prefix=f"{prefix}.mlp",
                 enable_eplb=enable_eplb,
             )
@@ -343,13 +380,22 @@ class Glm4MoeDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                quant_config=atom_config.quant_config,
+                reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
+            and self.layer_idx > 0
+            and self.layer_idx < config.num_hidden_layers,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
 
@@ -358,13 +404,16 @@ class Glm4MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        **model_kwargs: dict[str, Any] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, **model_kwargs
+        )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -373,6 +422,7 @@ class Glm4MoeDecoderLayer(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
+        "positions": -1,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
@@ -382,8 +432,6 @@ class Glm4MoeModel(nn.Module):
         super().__init__()
 
         config = atom_config.hf_config
-        cache_config = atom_config.kv_cache_dtype
-        quant_config = atom_config.quant_config
         self.config = config
 
         self.vocab_size = config.vocab_size
@@ -401,8 +449,7 @@ class Glm4MoeModel(nn.Module):
             config.num_hidden_layers,
             lambda prefix, layer_num=None: Glm4MoeDecoderLayer(
                 config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
+                atom_config=atom_config,
                 prefix=prefix,
                 layer_num=layer_num,
             ),
@@ -411,7 +458,11 @@ class Glm4MoeModel(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            )
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -427,6 +478,7 @@ class Glm4MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -440,7 +492,9 @@ class Glm4MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, **model_kwargs
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -467,19 +521,12 @@ class Glm4MoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        # When fusion is enabled, FusedMoE adds shared expert internally
-        # so we need to include it in the mapping as well
-        num_experts = self.config.n_routed_experts
-        if (
-            is_rocm_aiter_fusion_shared_expert_enabled()
-            and self.config.n_shared_experts
-        ):
-            num_experts += self.config.n_shared_experts
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
+            num_experts=self.config.n_routed_experts
+            + (self.config.n_shared_experts or 0),
         )
 
 
@@ -525,6 +572,7 @@ class Glm4MoeForCausalLM(nn.Module, Glm4MixtureOfExperts):
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
+        self.atom_config = atom_config
         config = atom_config.hf_config
         quant_config = atom_config.quant_config
         self.config = config
@@ -577,9 +625,10 @@ class Glm4MoeForCausalLM(nn.Module, Glm4MixtureOfExperts):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
         )
         return hidden_states
 

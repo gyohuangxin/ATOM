@@ -1,9 +1,11 @@
 import logging
-from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Union
+
 import torch
 
 if TYPE_CHECKING:
+    from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
     from atom.model_ops.moe import FusedMoEParallelConfig
 
 logger = logging.getLogger("atom")
@@ -198,7 +200,9 @@ class FusedMoEQuantConfig:
         if weight_dtype is None:
             weight_dtype = quant_dtype
 
-        a_shape, w_shape = _quant_flags_to_group_shape(quant_dtype, False, block_shape)
+        a_shape, w_shape = _quant_flags_to_group_shape(
+            quant_dtype, per_act_token_quant, block_shape
+        )
         quant_config = FusedMoEQuantConfig(
             _a1=FusedMoEQuantDesc(quant_dtype, a_shape, a1_scale),
             _a2=FusedMoEQuantDesc(quant_dtype, a_shape, a2_scale),
@@ -264,6 +268,33 @@ def fp8_w8a8_moe_quant_config(
     )
 
 
+def mxfp4_w4a8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    per_act_token_quant: bool = False,
+    block_shape: list[int] | None = None,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for fp8 activations and fp8 weights.
+    """
+    return FusedMoEQuantConfig.make(
+        torch.float8_e4m3fn,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        per_act_token_quant=per_act_token_quant,
+        block_shape=block_shape,
+        weight_dtype="mxfp4",
+    )
+
+
 FUSED_MOE_UNQUANTIZED_CONFIG: FusedMoEQuantConfig = FusedMoEQuantConfig.make()
 
 
@@ -275,9 +306,14 @@ class FusedMoEConfig:
 
     num_local_experts: int
     moe_parallel_config: "FusedMoEParallelConfig"
+    expert_layout: "MoEExpertLayout"
 
     # The activation type.
     in_dtype: torch.dtype | str | None = None
+    # activation quant type -- to differentiate triton aiter mxfp4 kernels
+    a_quant_dtype: torch.dtype | str | None = None
+
+    static_scale: torch.Tensor | None = None
 
     max_num_tokens: int = 256
 
@@ -324,3 +360,33 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+
+def moe_kernel_token_capacity(
+    atom_config,
+    *,
+    dp_size: int,
+    use_all2all: bool,
+    dp_logical_ratio: int = 1,
+) -> int:
+    """Token rows MoE kernels must reserve for this rank.
+
+    DP-attention + TP MoE all-gathers hidden states across DP ranks before
+    routing. AITER fused-shared-expert topK metadata is a single preallocated
+    ``[T, topk+shared]`` buffer, so ``T`` must cover the gathered width:
+    ``max_num_batched_tokens * dp_size`` (times the simulated-DP repeat).
+    All2all/EP keeps tokens local, so the per-rank scheduler budget is enough.
+
+    ``repeat_rows`` also runs alone in ``forward_impl`` (the single-real-rank
+    path, with no gather to ride along with), so the simulated-DP repeat
+    applies at ``dp_size == 1`` too.
+    """
+    tokens = atom_config.max_num_batched_tokens
+    if use_all2all:
+        return tokens
+    repeat = max(int(dp_logical_ratio), 1)
+    if atom_config.enable_dp_attention and dp_size > 1:
+        return tokens * dp_size * repeat
+    if dp_size == 1:
+        return tokens * repeat
+    return tokens

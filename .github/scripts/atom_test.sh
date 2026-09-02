@@ -4,31 +4,145 @@ set -euo pipefail
 TYPE=${1:-launch}
 MODEL_PATH=${2:-meta-llama/Meta-Llama-3-8B-Instruct}
 EXTRA_ARGS=("${@:3}")
+ATOM_DOCKER_IMAGE=${ATOM_DOCKER_IMAGE:-}
+ATOM_SERVER_PORT=${ATOM_SERVER_PORT:-8000}
 
+print_device_mapping_debug() {
+  [ "${ATOM_DEBUG_DEVICE_MAPPING:-0}" = "1" ] || return 0
+
+  echo ""
+  echo "========== PyTorch HIP device mapping before ATOM launch =========="
+  python3 - <<'PY'
+import os
+
+keys = [
+    "HIP_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "LOCAL_RANK",
+    "RANK",
+    "WORLD_SIZE",
+]
+for key in keys:
+    print(f"{key}={os.environ.get(key)}")
+
+try:
+    import torch
+except Exception as exc:
+    print(f"torch import failed: {type(exc).__name__}: {exc}")
+    raise SystemExit(0)
+
+print(f"torch.version.hip={getattr(torch.version, 'hip', None)}")
+print(f"torch.cuda.is_available={torch.cuda.is_available()}")
+try:
+    count = torch.cuda.device_count()
+    print(f"torch.cuda.device_count={count}")
+    for index in range(count):
+        print(f"device[{index}]={torch.cuda.get_device_name(index)}")
+except Exception as exc:
+    print(f"torch cuda probe failed: {type(exc).__name__}: {exc}")
+PY
+}
 
 if [ "$TYPE" == "launch" ]; then
   echo ""
   echo "========== Launching ATOM server =========="
-  python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${EXTRA_ARGS[@]}" &
+  # Clear stale compile cache to avoid NameError from outdated generated code
+  echo "Clearing compile cache..."
+  rm -rf ~/.cache/atom/*
+  PROFILER_ARGS=""
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
+    echo "Torch profiler enabled, trace output: /app/trace"
+  fi
+
+  # RTL (rocm-trace-lite) GPU kernel tracing
+  RTL_CMD=""
+  if [ "${ENABLE_RTL_PROFILER:-0}" == "1" ]; then
+    RTL_TRACE_DIR="${ATOM_RTL_TRACE_DIR:-/app/rtl_traces}"
+    mkdir -p "$RTL_TRACE_DIR"
+    if command -v rtl &>/dev/null; then
+      RTL_CMD="rtl trace -o ${RTL_TRACE_DIR}/trace.db --"
+      echo "RTL profiler enabled, trace output: ${RTL_TRACE_DIR}"
+    else
+      echo "WARNING: RTL profiler requested but rtl command not found, skipping"
+    fi
+  fi
+
+  ATOM_SERVER_LOG="/tmp/atom_server.log"
+  SERVER_PORT_ARGS=("--server-port" "$ATOM_SERVER_PORT")
+  print_device_mapping_debug
+  echo ""
+  echo "========== ATOM server command =========="
+  echo "PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model $MODEL_PATH ${SERVER_PORT_ARGS[@]} $PROFILER_ARGS ${EXTRA_ARGS[@]}"
+  echo "=========================================="
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
+  tail -f "$ATOM_SERVER_LOG" &
+  _tail_launch_pid=$!
+  trap 'kill $_tail_launch_pid 2>/dev/null || true' EXIT
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  max_retries=30
+  # Phase 1: Wait for HTTP server to be up via /health endpoint (45 min max)
+  max_retries=45
   retry_interval=60
+  server_up=false
   for ((i=1; i<=max_retries; i++)); do
-      if curl -s http://localhost:8000/v1/completions -o /dev/null; then
-          echo "ATOM server is up."
+      if ! kill -0 $atom_server_pid 2>/dev/null; then
+          echo "ATOM server process exited unexpectedly."
+          echo "Last 50 lines of server log:"
+          tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
+          exit 1
+      fi
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/health" -o /dev/null; then
+          echo "ATOM server HTTP endpoint is up."
+          server_up=true
           break
       fi
       echo "Waiting for ATOM server to be ready... ($i/$max_retries)"
       sleep $retry_interval
   done
-  if ! curl -s http://localhost:8000/v1/completions -o /dev/null; then
+  if [ "$server_up" = false ]; then
       echo "ATOM server did not start after $((max_retries * retry_interval)) seconds."
       kill $atom_server_pid
       exit 1
   fi
+
+  # Phase 2: Warmup - send a real completion request to ensure model is fully ready
+  # (CUDA graph capture, JIT compilation, etc. may still be in progress after /health returns OK)
+  echo "========== Warming up ATOM server =========="
+  warmup_retries=10
+  warmup_interval=30
+  warmup_done=false
+  for ((i=1; i<=warmup_retries; i++)); do
+      if ! kill -0 $atom_server_pid 2>/dev/null; then
+          echo "ATOM server process exited unexpectedly during warmup."
+          echo "Last 50 lines of server log:"
+          tail -50 "$ATOM_SERVER_LOG" 2>/dev/null || true
+          exit 1
+      fi
+      if curl -sf "http://localhost:${ATOM_SERVER_PORT}/v1/completions" \
+          -H "Content-Type: application/json" \
+          -d '{"model":"'"$MODEL_PATH"'","prompt":"hi","max_tokens":1}' \
+          -o /dev/null --max-time 120; then
+          echo "ATOM server warmup completed successfully."
+          warmup_done=true
+          break
+      fi
+      echo "Warmup attempt $i/$warmup_retries failed, retrying in ${warmup_interval}s..."
+      sleep $warmup_interval
+  done
+  if [ "$warmup_done" = false ]; then
+      echo "ATOM server warmup failed after $((warmup_retries * warmup_interval)) seconds."
+      kill $atom_server_pid
+      exit 1
+  fi
+
+  # Stop streaming server log now that launch is complete;
+  # test phases (accuracy/benchmark) keep their output clean.
+  # Full server log is available via the workflow "Dump server log" step.
+  kill $_tail_launch_pid 2>/dev/null || true
 fi
 
 if [ "$TYPE" == "accuracy" ]; then
@@ -42,30 +156,356 @@ if [ "$TYPE" == "accuracy" ]; then
 
   echo ""
   echo "========== Running accuracy test =========="
+  ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
+  # Set umask so files created by lm_eval are world-readable (container runs as root,
+  # host runner user needs to read results via the shared volume mount)
+  umask 0022
   mkdir -p accuracy_test_results
-  RESULT_FILENAME=accuracy_test_results/$(date +%Y%m%d%H%M%S).json
-  lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False \
-          --tasks gsm8k \
-          --num_fewshot 3 \
-          --output_path "${RESULT_FILENAME}"
+  RUN_TAG=$(date +%Y%m%d%H%M%S)
+  OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
+  FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
+  CLIENT_COMMAND="${CLIENT_COMMAND:-}"
+  if [[ "${CLIENT_COMMAND}" == "null" ]]; then
+    CLIENT_COMMAND=""
+  fi
+
+  if [[ -n "${CLIENT_COMMAND}" ]]; then
+    CLIENT_COMMAND_ARGS=()
+    while IFS= read -r -d '' token; do
+      CLIENT_COMMAND_ARGS+=("${token}")
+    done < <(
+      CLIENT_COMMAND="${CLIENT_COMMAND}" \
+      MODEL_PATH_VALUE="${MODEL_PATH}" \
+      OUTPUT_PATH_VALUE="${OUTPUT_PATH}" \
+      python3 - <<'PY'
+import os
+import shlex
+import sys
+
+client_command = os.environ["CLIENT_COMMAND"]
+replacements = {
+    "${MODEL_PATH}": os.environ["MODEL_PATH_VALUE"],
+    "$MODEL_PATH": os.environ["MODEL_PATH_VALUE"],
+    "${OUTPUT_PATH}": os.environ["OUTPUT_PATH_VALUE"],
+    "$OUTPUT_PATH": os.environ["OUTPUT_PATH_VALUE"],
+}
+for src, dst in replacements.items():
+    client_command = client_command.replace(src, dst)
+
+for token in shlex.split(client_command):
+    sys.stdout.write(token)
+    sys.stdout.write("\0")
+PY
+    )
+
+    if [[ ${#CLIENT_COMMAND_ARGS[@]} -eq 0 ]]; then
+      echo "ERROR: CLIENT_COMMAND is set but empty after parsing."
+      exit 2
+    fi
+
+    for arg in "${CLIENT_COMMAND_ARGS[@]}"; do
+      if [[ "${arg}" =~ \$\{[A-Z0-9_]+\} ]] || [[ "${arg}" =~ \$[A-Z_][A-Z0-9_]* ]]; then
+        echo "ERROR: CLIENT_COMMAND contains unresolved placeholder after expansion: ${arg}"
+        exit 2
+      fi
+    done
+
+    echo "Using custom lm-eval command from client_command: ${CLIENT_COMMAND}"
+    # Background the client + tee pipeline in its own process group so
+    # wait_infer_drain.sh can supervise the engine in the foreground and we
+    # can SIGTERM the whole group on hang/fault. `set -m` (job control)
+    # gives each backgrounded pipeline its own pgid == $!.
+    set -m
+    ( "${CLIENT_COMMAND_ARGS[@]}" 2>&1 | tee "$ATOM_CLIENT_LOG" ) &
+    CLIENT_PID=$!
+    set +m
+  else
+    echo "Using default lm-eval command."
+    set -m
+    (
+      lm_eval --model local-completions \
+              --model_args "model=${MODEL_PATH},base_url=http://localhost:${ATOM_SERVER_PORT}/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+              --tasks gsm8k \
+              --num_fewshot 3 \
+              --output_path "${OUTPUT_PATH}" \
+              2>&1 | tee "$ATOM_CLIENT_LOG"
+    ) &
+    CLIENT_PID=$!
+    set +m
+  fi
+
+  # Supervise: drain detects engine fault (exit 2 in <=10s), engine hang
+  # (exit 1 in <=60s), clean completion (exit 0 when client gone + no
+  # pending output), or timeout (exit 4 at MAX_MIN). Without this the
+  # accuracy step burns the full `timeout-minutes` whenever an aiter
+  # kernel asserts mid-prefill or a GPU faults — lm_eval just keeps
+  # retrying against a dead engine for 30 min.
+  echo "========== Supervising client with wait_infer_drain.sh =========="
+  # STUCK_POLLS=18 (×10s = 3 min) keeps drain patient through:
+  #   - benchmark warmup phases (tqdm rarely flushes during the initial
+  #     concurrency burst on short ISL configs)
+  #   - DP-attention SHM coordination warnings (`shared memory broadcast
+  #     block found in 60.0 seconds` is CPU-idle waiting, not a hang)
+  # Real GPU hangs / faults still surface in <=30 min (MAX_MIN unchanged).
+  bash scripts/wait_infer_drain.sh 8000 30 10 "$ATOM_CLIENT_LOG" 18
+  DRAIN_RC=$?
+  if [ "$DRAIN_RC" -ne 0 ]; then
+    echo "wait_infer_drain.sh exit=$DRAIN_RC — killing client pgid $CLIENT_PID"
+    # `kill -- -PGID` signals the whole group (set -m made CLIENT_PID == pgid).
+    # Negative target requires `--` separator so bash doesn't parse it as a flag.
+    kill -TERM -- -"$CLIENT_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$CLIENT_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- -"$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    exit "$DRAIN_RC"
+  fi
+  # Drain clean: client should be near-done. Reap exit status.
+  wait "$CLIENT_PID" || true
+
+  RESULT_FILENAME=$(
+    python3 - <<PY
+from pathlib import Path
+
+candidate_roots = [Path("${OUTPUT_PATH}"), Path("accuracy_test_results")]
+json_candidates = []
+for root in candidate_roots:
+    if root.is_file() and root.suffix == ".json":
+        json_candidates.append(root)
+    elif root.is_dir():
+        for path in root.rglob("*.json"):
+            if path.is_file():
+                json_candidates.append(path)
+
+if not json_candidates:
+    print("")
+else:
+    latest = max(json_candidates, key=lambda path: path.stat().st_mtime_ns)
+    print(str(latest))
+PY
+  )
+  if [[ -z "${RESULT_FILENAME}" || ! -f "${RESULT_FILENAME}" ]]; then
+    echo "ERROR: No results JSON file found under ${OUTPUT_PATH} or accuracy_test_results"
+    exit 2
+  fi
+
+  if [[ "${RESULT_FILENAME}" != "${FLAT_RESULT_FILE}" ]]; then
+    cp -f "${RESULT_FILENAME}" "${FLAT_RESULT_FILE}"
+    RESULT_FILENAME="${FLAT_RESULT_FILE}"
+  fi
+
+  if [ -n "${ATOM_DOCKER_IMAGE:-}" ] || [ -n "${GPU_NAME:-}" ] || [ -n "${GPU_VRAM_GB:-}" ] || [ -n "${ROCM_VERSION:-}" ]; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_DOCKER_IMAGE="${ATOM_DOCKER_IMAGE:-}" \
+    GPU_NAME="${GPU_NAME:-}" \
+    GPU_VRAM_GB="${GPU_VRAM_GB:-}" \
+    ROCM_VERSION="${ROCM_VERSION:-}" \
+    python3 - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("ATOM_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["ATOM_DOCKER_IMAGE"]
+if os.environ.get("GPU_NAME"):
+    metadata["gpu_name"] = os.environ["GPU_NAME"]
+if os.environ.get("GPU_VRAM_GB"):
+    try:
+        metadata["gpu_vram_gb"] = int(float(os.environ["GPU_VRAM_GB"]))
+    except ValueError:
+        pass
+if os.environ.get("ROCM_VERSION"):
+    metadata["rocm_version"] = os.environ["ROCM_VERSION"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
+  # Extract MTP acceptance rate from server log (if present)
+  ATOM_SERVER_LOG="${ATOM_SERVER_LOG:-/tmp/atom_server.log}"
+  if [ -f "$ATOM_SERVER_LOG" ]; then
+    RESULT_FILE="${RESULT_FILENAME}" \
+    ATOM_SERVER_LOG="$ATOM_SERVER_LOG" \
+    python3 - <<'PY'
+import json, os, re
+
+result_file = os.environ["RESULT_FILE"]
+server_log = os.environ["ATOM_SERVER_LOG"]
+
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+with open(server_log, encoding="utf-8", errors="replace") as f:
+    for line in reversed(f.readlines()):
+        if "[MTP Stats " in line and "Interval" not in line:
+            m = re.search(
+                r"Average toks/fwd: ([\d.]+).*Acceptance rate: ([\d.]+)%",
+                line,
+            )
+            if m:
+                meta = data.setdefault("atom_ci_metadata", {})
+                meta["mtp_acceptance_rate"] = float(m.group(2))
+                meta["avg_tokens_per_forward"] = float(m.group(1))
+                break
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+  fi
+
   echo "Accuracy test results saved to ${RESULT_FILENAME}"
-  chmod -R 777 accuracy_test_results
+fi
+
+if [ "$TYPE" == "stop" ]; then
+  echo ""
+  echo "========== Stopping ATOM server =========="
+
+  # Generate RTL trace summary before killing the server
+  RTL_TRACE_DIR="${ATOM_RTL_TRACE_DIR:-/app/rtl_traces}"
+  if [ -d "$RTL_TRACE_DIR" ] && ls "$RTL_TRACE_DIR"/trace*.db 1>/dev/null 2>&1; then
+    echo "Generating RTL trace summary..."
+    for db in "$RTL_TRACE_DIR"/trace*.db; do
+      rtl summary "$db" > "${db%.db}_summary.txt" 2>/dev/null || true
+    done
+    echo "RTL traces: $(ls "$RTL_TRACE_DIR"/*.db 2>/dev/null | wc -l) db files"
+  fi
+
+  # Wait for trace files to finish writing (before killing the server process)
+  TRACE_DIR="${TORCH_PROFILER_DIR:-/app/trace}"
+  if [ -d "$TRACE_DIR" ]; then
+    echo "Waiting for trace files to finish writing..."
+    for i in $(seq 1 120); do
+      TMP_COUNT=$(find "$TRACE_DIR" -name '*.tmp' 2>/dev/null | wc -l)
+      if [ "$TMP_COUNT" -eq 0 ]; then
+        echo "Trace files ready after ${i}s"
+        break
+      fi
+      [ "$i" -eq 120 ] && echo "WARNING: trace .tmp files still present after 120s"
+      sleep 1
+    done
+  fi
+
+  # Kill server processes
+  pkill -f 'atom.entrypoints' || true
+  sleep 2
+  pkill -9 -f 'multiprocessing.spawn' || true
+  pkill -9 -f 'multiprocessing.resource_tracker' || true
+
+  # Wait for GPU memory to release
+  echo "Waiting for GPU memory to release..."
+  for i in $(seq 1 60); do
+    USED_GPUS=$(rocm-smi --showmemuse 2>/dev/null | grep "VRAM%" | awk '{print $NF}' | awk '$1 > 0' | wc -l 2>/dev/null || echo "0")
+    if [ "$USED_GPUS" -eq 0 ]; then
+      echo "GPU memory released after ${i}s"
+      break
+    fi
+    if [ "$i" -eq 60 ]; then
+      echo "WARNING: GPU memory still in use after 60s, force killing GPU processes"
+      rocm-smi --showpidgpus 2>&1 | grep -oP 'PID \K\d+' | while read pid; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+      sleep 5
+    fi
+    sleep 1
+  done
+  echo "Server stopped."
 fi
 
 if [ "$TYPE" == "benchmark" ]; then
   echo ""
-  echo "========== Cloning bench_serving =========="
-  git clone https://github.com/kimbochen/bench_serving.git && chmod +x bench_serving/benchmark_serving.py
   echo "========== Running benchmark test =========="
-  python bench_serving/benchmark_serving.py \
-    --model=$MODEL_PATH --backend=vllm --base-url="http://localhost:8000" \
-    --dataset-name=random \
-    --random-input-len=$ISL --random-output-len=$OSL --random-range-ratio=$RANDOM_RANGE_RATIO \
-    --max-concurrency=$CONC \
-    --num-prompts=$(( $CONC * 10 )) \
-    --trust-remote-code \
-    --request-rate=inf --ignore-eos \
-    --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-    --result-dir=. --result-filename=${RESULT_FILENAME}.json
+  ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
+  RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
+  PROFILE_ARG=""
+  if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
+    PROFILE_ARG="--profile"
+    echo "Profiling enabled via --profile flag"
+  fi
+  # Build the benchmark command as an array so the printed command is exactly
+  # what runs (no echo/cmd drift). $PROFILE_ARG and $BENCH_EXTRA_ARGS stay
+  # unquoted so they word-split into 0+ args, matching the previous behavior.
+  BENCH_CMD=(
+    python -m atom.benchmarks.benchmark_serving
+    --model="$MODEL_PATH" --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}"
+    --dataset-name=random
+    --random-input-len="$ISL" --random-output-len="$OSL" --random-range-ratio="$RANDOM_RANGE_RATIO"
+    --max-concurrency="$CONC"
+    --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 10 ))}"
+    --trust-remote-code
+    --num-warmups="$(( CONC * 2 ))"
+    --request-rate=inf --ignore-eos
+    --save-result --percentile-metrics="ttft,tpot,itl,e2el"
+    --result-dir=. --result-filename="${RESULT_FILENAME}.json"
+    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
+  )
+  echo "Benchmark command:"
+  printf '%q ' "${BENCH_CMD[@]}"
+  echo
+  # Background the benchmark + tee pipeline in its own process group so
+  # wait_infer_drain.sh can supervise the engine in the foreground and
+  # SIGTERM the whole group on hang/fault. Same pattern as the accuracy
+  # block — see comments there.
+  set -m
+  (
+    "${BENCH_CMD[@]}" 2>&1 | tee "$ATOM_CLIENT_LOG"
+  ) &
+  CLIENT_PID=$!
+  set +m
+
+  echo "========== Supervising benchmark with wait_infer_drain.sh =========="
+  # Per-model overrides: ATOM_BENCHMARK_STUCK_POLLS, ATOM_BENCHMARK_MAX_MINUTES.
+  # Default stuck window is 18 × POLL_SEC (3 min); long-running cases (e.g.
+  # 8k/1k high concurrency) set ATOM_BENCHMARK_STUCK_POLLS in models.json.
+  benchmark_max_minutes=${ATOM_BENCHMARK_MAX_MINUTES:-120}
+  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-18}
+  bash scripts/wait_infer_drain.sh \
+    ${ATOM_SERVER_PORT} "$benchmark_max_minutes" 10 \
+    "$ATOM_CLIENT_LOG" "$benchmark_stuck_polls"
+  DRAIN_RC=$?
+  if [ "$DRAIN_RC" -ne 0 ]; then
+    echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"
+    kill -TERM -- -"$CLIENT_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$CLIENT_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- -"$CLIENT_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" 2>/dev/null || true
+    exit "$DRAIN_RC"
+  fi
+  wait "$CLIENT_PID" || true
+
+  # Inject ISL/OSL into result JSON for summary table
+  if [ -f "${RESULT_FILENAME}.json" ]; then
+    RESULT_PATH="${RESULT_FILENAME}.json" python3 - <<'PY'
+import json
+import os
+import re
+
+result_path = os.environ["RESULT_PATH"]
+with open(result_path, encoding="utf-8") as f:
+    d = json.load(f)
+
+d["random_input_len"] = int(os.environ["ISL"])
+d["random_output_len"] = int(os.environ["OSL"])
+d["benchmark_backend"] = "ATOM"
+
+server_args = os.environ.get("SERVER_ARGS", "")
+tp_match = re.search(r"(?:^|\s)-tp\s+(\d+)", server_args)
+d["tensor_parallel_size"] = int(tp_match.group(1)) if tp_match else 1
+dp_match = re.search(r"(?:--data-parallel-size|(?:^|\s)-dp)\s+(\d+)", server_args)
+d["data_parallel_size"] = int(dp_match.group(1)) if dp_match else 1
+d["enable_dp_attention"] = "--enable-dp-attention" in server_args
+
+with open(result_path, "w", encoding="utf-8") as f:
+    json.dump(d, f, indent=2)
+PY
+  fi
 fi

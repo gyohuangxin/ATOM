@@ -6,20 +6,29 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
 import warnings
 
 import torch
+import triton
 from einops import rearrange
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
+from .fused_cumsum_kkt import fused_cumsum_kkt
+from .fused_merge_recompute import fused_merge_recompute
+from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
-from .solve_tril import solve_tril
-from .utils import SUPPRESS_LEVEL, input_guard
+from .solve_tril import solve_tril, solve_tril_16x16_kernel
+from .utils import SUPPRESS_LEVEL, input_guard, is_amd
 from .wy_fast import recompute_w_u_fwd
+
+#: Token grid the chunked recurrence lands its per-chunk states on. Hardcoded
+#: throughout this file rather than a parameter, so a consumer of `h` — the SSM
+#: state cache is the only one — reads it from here instead of restating 64.
+#: A checkpoint is takeable at multiples of this and nowhere else.
+CHUNK_SIZE = 64
 
 
 def chunk_gated_delta_rule_fwd(
@@ -32,21 +41,52 @@ def chunk_gated_delta_rule_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
+    o: torch.Tensor | None = None,
+    keep_intermediate_states: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
-    )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-    )
+    B, T = q.shape[0], q.shape[1]
+    Hv = g.shape[2]
+
+    if is_amd and T >= 64:
+        # OP-B: HIP fast path. 3 fused kernels replace 4-step:
+        # chunk_local_cumsum + chunk_scaled_dot_kkt → fused_cumsum_kkt
+        # solve_tril(BT=64) (full inverse) → solve_tril_16x16 (diag only)
+        # recompute_w_u_fwd → fused_merge_recompute (cross-block inverse + w/u in SMEM)
+        g, A = fused_cumsum_kkt(g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens)
+        chunk_indices_16 = (
+            prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+        )
+        NT_16 = len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
+        Ai16 = torch.empty(B, T, Hv, 16, device=A.device, dtype=torch.float32)
+        solve_tril_16x16_kernel[(NT_16, B * Hv)](
+            A=A,
+            Ai=Ai16,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_16,
+            T=T,
+            H=Hv,
+            BT=64,
+            USE_TMA=False,
+            DOT_PRECISION="ieee",
+        )
+        w, u = fused_merge_recompute(
+            k, v, beta, g, A, Ai16, chunk_size=64, cu_seqlens=cu_seqlens
+        )
+    else:
+        g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+        # obtain WY representation. u is actually the new v.
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        )
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+        )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -64,14 +104,51 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        o=o,
     )
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+    # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
+    # where h[:, j] is the state after j*chunk_size tokens. The SSM state cache
+    # reads checkpoints straight out of it, which is what lets a checkpoint be
+    # taken at an interior position without splitting the prefill into two
+    # forwards.
+    #
+    # Returned only when a caller asked for it. The kernel computes it either
+    # way, so returning it costs no compute — but it costs *lifetime*: handed
+    # back unconditionally, the caller's frame pins ~33 MB (T=8192, H=8,
+    # K=V=128) for the rest of that layer's forward, on every GDN prefill with
+    # checkpointing off, which is the default and every non-ATOM plugin caller.
+    # That raises the allocator high-water mark KV sizing is computed against,
+    # for nobody. Dropping the reference here frees it with the fwd frame.
+    return (
+        g,
+        o,
+        A,
+        final_state,
+        (w if SUPPRESS_LEVEL >= 3 else None),
+        (h if keep_intermediate_states else None),
+        v_new,
+    )
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+    # Per-chunk recurrent states from the most recent forward, for the SSM
+    # state cache (see `pop_last_intermediate_states`). Overwritten every
+    # call; the consumer reads it immediately after its own forward.
+    #
+    # Captured only when `keep_intermediate_states` asks for it, i.e. when the
+    # caller is ATOM's state-cache path and will actually pop it. `h` is large
+    # (see `keep_intermediate_states`) and callers that never pop — the vLLM,
+    # SGLang and rtpllm plugins among them — would otherwise pin one
+    # indefinitely after their last forward.
+    #
+    # An explicit flag rather than something inferred from the call. Upstream
+    # keys this off `dst_indices is not None`, which reads as "the paged path,
+    # so the popper", but ATOM routes src->dst by gather/scatter around the
+    # kernel and never passes `dst_indices` at all — inferring it here would
+    # leave `last_h` permanently None, `pop` returning None, and the whole
+    # checkpoint write silently skipped with nothing to show for it.
+    last_h = None
+
     @staticmethod
     @input_guard
     @torch.amp.custom_fwd(device_type="cuda")
@@ -87,11 +164,16 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        o: torch.Tensor | None = None,
+        keep_intermediate_states: bool = False,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
+        # NOTE: input_guard calls .contiguous() on every Tensor arg including
+        # o. The public chunk_gated_delta_rule entry point pre-asserts o is
+        # contiguous before .apply() so this can't silently clone.
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -102,10 +184,23 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            o=o,
+            keep_intermediate_states=keep_intermediate_states,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        return o.to(q.dtype), final_state
+        # Per-chunk states, for the SSM state cache. Parked on the class so the
+        # (fixed) 2-tuple return contract stays intact for every existing
+        # caller, including the vLLM and rtpllm plugins. `h` is already None
+        # unless asked for -- assigned rather than skipped because a stale one
+        # from an earlier step is the wrong shape *and* the wrong tokens, and
+        # `pop` has no way to tell.
+        ChunkGatedDeltaRuleFunction.last_h = h
+        # Skip the dtype cast when it's a no-op so the caller's buffer is
+        # the literal returned tensor (preserves the inplace contract).
+        if o.dtype != q.dtype:
+            o = o.to(q.dtype)
+        return o, final_state
 
 
 @torch.compiler.disable
@@ -121,6 +216,8 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    o: torch.Tensor | None = None,
+    keep_intermediate_states: bool = False,
 ):
     r"""
     Args:
@@ -149,6 +246,11 @@ def chunk_gated_delta_rule(
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
             Default: `False`.
+        keep_intermediate_states (Optional[bool]):
+            Retain the per-chunk recurrent states of this call for
+            `pop_last_intermediate_states` to collect. Default: `False`, which
+            drops them as soon as the forward returns — they are ~33 MB at
+            T=8192, H=8, K=V=128, so a caller that never pops must not ask.
 
     Returns:
         o (torch.Tensor):
@@ -193,6 +295,17 @@ def chunk_gated_delta_rule(
         len(beta.shape) == 3
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
+    if o is not None and head_first:
+        # head_first=True + o= would route the kernel output through a
+        # rearrange("b t h ... -> b h t ...") below, producing a
+        # non-contiguous view of the caller's storage and silently
+        # breaking the inplace contract. Reject up front BEFORE the
+        # existing head_first DeprecationWarning so callers see the more
+        # specific error.
+        raise NotImplementedError(
+            "chunk_gated_delta_rule(o=...) does not support head_first=True"
+        )
+
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
@@ -223,6 +336,23 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if o is not None:
+        # Pre-check contiguity HERE — input_guard inside
+        # ChunkGatedDeltaRuleFunction.forward will call .contiguous() on
+        # every Tensor arg including o, silently cloning a non-contiguous
+        # caller buffer and writing the kernel output into the clone
+        # instead of the caller's storage. Asserting before .apply() is
+        # the only place where we can catch that loudly.
+        assert o.shape == v.shape, (
+            f"chunk_gated_delta_rule: o.shape {tuple(o.shape)} != v.shape "
+            f"{tuple(v.shape)}"
+        )
+        assert (
+            o.dtype == v.dtype
+        ), f"chunk_gated_delta_rule: o.dtype {o.dtype} != v.dtype {v.dtype}"
+        assert (
+            o.is_contiguous()
+        ), "chunk_gated_delta_rule: caller-provided o must be contiguous"
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -234,7 +364,27 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        o,
+        keep_intermediate_states,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
     return o, final_state
+
+
+def pop_last_intermediate_states():
+    """Per-chunk recurrent states from the most recent chunked GDN forward.
+
+    ``h[:, j]`` is the state after ``j * chunk_size`` tokens, so the SSM state
+    cache can take a checkpoint at any chunk-aligned interior position without
+    splitting the prefill into two forward passes.
+
+    ``h`` is stored in the input dtype; see ``GDNStateMixin.state_transfer``
+    for why that makes a checkpoint exact for every model on this path.
+
+    Consumes the reference so a later caller cannot read a stale tensor, and
+    returns None when the last forward was not asked to keep its states.
+    """
+    h = ChunkGatedDeltaRuleFunction.last_h
+    ChunkGatedDeltaRuleFunction.last_h = None
+    return h

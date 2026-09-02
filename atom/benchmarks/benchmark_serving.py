@@ -27,25 +27,30 @@ On the client side, run:
 
 import argparse
 import asyncio
-import base64
+import collections
+import contextlib
+import functools
 import gc
-import io
 import json
 import os
 import random
 import time
 import warnings
-from argparse import ArgumentParser as FlexibleArgumentParser
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any
 
+import aiohttp
 import numpy as np
-import pandas as pd
-from datasets import load_dataset
-from PIL.Image import Image
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
+
+from atom.entrypoints.openai.chat_encoders import (
+    apply_chat_template,
+    load_custom_message_encoder,
+)
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,
@@ -67,300 +72,101 @@ class BenchmarkMetrics:
     request_goodput: float
     output_throughput: float
     total_token_throughput: float
+    concurrency: float
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
-    percentiles_ttft_ms: List[Tuple[float, float]]
+    percentiles_ttft_ms: list[tuple[float, float]]
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
-    percentiles_tpot_ms: List[Tuple[float, float]]
+    percentiles_tpot_ms: list[tuple[float, float]]
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
-    percentiles_itl_ms: List[Tuple[float, float]]
+    percentiles_itl_ms: list[tuple[float, float]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
     # a request to receiving a complete response.
     mean_e2el_ms: float
     median_e2el_ms: float
     std_e2el_ms: float
-    percentiles_e2el_ms: List[Tuple[float, float]]
+    percentiles_e2el_ms: list[tuple[float, float]]
 
 
-def sample_sharegpt_requests(
-    dataset_path: str,
-    num_requests: int,
+# Prompts per tokenizer call while generating the random dataset. Large enough
+# that the fast tokenizer's internal batching is what dominates, small enough
+# that a batch's encodings are not held for the whole dataset.
+_TOKENIZE_BATCH = 4096
+# How many decode/encode round trips a prompt gets to reach its target length
+# before the benchmark accepts whatever length it has.
+_LENGTH_FIX_ROUNDS = 10
+
+
+def _round_trip_prompts(
     tokenizer: PreTrainedTokenizerBase,
-    fixed_output_len: Optional[int] = None,
-) -> List[Tuple[str, int, int, None]]:
-    # Load the dataset.
-    with open(dataset_path, encoding="utf-8") as f:
-        dataset = json.load(f)
-    # Filter out the conversations with less than 2 turns.
-    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
-    # Only keep the first two turns of each conversation.
-    dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
-        for data in dataset
-    ]
+    rng: np.random.Generator,
+    token_id_lists: list[list[int]],
+    target_lens: list[int],
+) -> tuple[list[str], list[int]]:
+    """Decode ids to text, adjusting until each re-encodes to its target length.
 
-    # Shuffle the dataset.
-    random.shuffle(dataset)
+    Decoding is not injective: N consecutive ids can encode back to a different
+    number of tokens (for GPT2Tokenizer, [6880, 6881] -> 'Ġcallshere' ->
+    [1650, 939, 486]), so a prompt has to be re-encoded and padded or truncated
+    until it round-trips at the length the benchmark asked for. Measured on a
+    real tokenizer the first re-encode fails for essentially every prompt --
+    4022 encodes for 2000 prompts -- so the loop below runs at least twice.
 
-    # Filter out sequences that are too long or too short
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for i in range(len(dataset)):
-        if len(filtered_dataset) == num_requests:
+    Both directions are issued as whole batches. A fast tokenizer parallelises a
+    batch internally, and one call per prompt forfeits that plus a Python/Rust
+    crossing each time: 5.0x on 2000 prompts at input_len 1024.
+
+    Returns the prompts and the token length each one actually encodes to, which
+    equals its target unless a prompt ran out of rounds without converging.
+    """
+    prompts = tokenizer.batch_decode(token_id_lists)
+    token_lens = [0] * len(prompts)
+    pending = list(range(len(prompts)))
+
+    for _ in range(_LENGTH_FIX_ROUNDS):
+        if not pending:
             break
-
-        # Tokenize the prompts and completions.
-        prompt = dataset[i][0]
-        prompt_token_ids = tokenizer(prompt).input_ids
-        completion = dataset[i][1]
-        completion_token_ids = tokenizer(completion).input_ids
-        prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
-        if prompt_len < 4 or (fixed_output_len is None and output_len < 4):
-            # Prune too short sequences.
-            continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
-            continue
-        filtered_dataset.append((prompt, prompt_len, output_len, None))
-
-    return filtered_dataset
-
-
-def sample_burstgpt_requests(
-    dataset_path: str,
-    num_requests: int,
-    random_seed: int,
-    tokenizer: PreTrainedTokenizerBase,
-) -> List[Tuple[str, int, int, None]]:
-    df = pd.read_csv(dataset_path)
-    gpt4_df = df[df["Model"] == "GPT-4"]
-    # Remove the failed requests (i.e., response length is 0)
-    gpt4_df = gpt4_df[gpt4_df["Response tokens"] > 0]
-    # Randomly sample num_requests from the dataset
-    if num_requests <= len(gpt4_df):
-        gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed)
-    else:
-        gpt4_df = gpt4_df.sample(n=num_requests, random_state=random_seed, replace=True)
-    # Convert the dataframe to a list of tuples
-    dataset = gpt4_df.values.tolist()
-    input_requests = []
-    for i in range(num_requests):
-        input_len = int(dataset[i][2])
-        output_len = int(dataset[i][3])
-        prompt = tokenizer.decode(
-            [(i + j) % tokenizer.vocab_size for j in range(input_len)]
-        )
-        input_requests.append((prompt, input_len, output_len, None))
-    return input_requests
-
-
-def sample_sonnet_requests(
-    dataset_path: str,
-    num_requests: int,
-    input_len: int,
-    output_len: int,
-    prefix_len: int,
-    tokenizer: PreTrainedTokenizerBase,
-) -> List[Tuple[str, str, int, int, None]]:
-    assert (
-        input_len > prefix_len
-    ), "'args.sonnet-input-len' must be greater than 'args.prefix-input-len'."
-
-    # Load the dataset.
-    with open(dataset_path, encoding="utf-8") as f:
-        poem_lines = f.readlines()
-
-    # Tokenize the poem lines.
-    poem_token_ids = tokenizer(poem_lines).input_ids
-    average_poem_len = sum(len(token_ids) for token_ids in poem_token_ids) / len(
-        poem_token_ids
-    )
-
-    # Base prefix for all requests.
-    base_prompt = "Pick as many lines as you can from these poem lines:\n"
-    base_message = [
-        {
-            "role": "user",
-            "content": base_prompt,
-        }
-    ]
-    base_prompt_formatted = tokenizer.apply_chat_template(
-        base_message, add_generation_prompt=True, tokenize=False
-    )
-    base_prompt_offset = len(tokenizer(base_prompt_formatted).input_ids)
-
-    assert (
-        input_len > base_prompt_offset
-    ), f"Please set 'args.sonnet-input-len' higher than {base_prompt_offset}."
-    num_input_lines = round((input_len - base_prompt_offset) / average_poem_len)
-
-    # First approximately `prefix_len` number of tokens in the
-    # prompt are fixed poem lines.
-    assert (
-        prefix_len > base_prompt_offset
-    ), f"Please set 'args.sonnet-prefix-len' higher than {base_prompt_offset}."
-
-    num_prefix_lines = round((prefix_len - base_prompt_offset) / average_poem_len)
-    prefix_lines = poem_lines[:num_prefix_lines]
-
-    # Sample the rest of lines per request.
-    sampled_requests: List[Tuple[str, int, int]] = []
-    for _ in range(num_requests):
-        num_lines_needed = num_input_lines - num_prefix_lines
-        sampled_lines = "".join(
-            prefix_lines + random.choices(poem_lines, k=num_lines_needed)
-        )
-
-        prompt = f"{base_prompt}{sampled_lines}"
-        message = [
-            {
-                "role": "user",
-                "content": prompt,
-            },
+        encoded = tokenizer([prompts[i] for i in pending], add_special_tokens=False)[
+            "input_ids"
         ]
-        prompt_formatted = tokenizer.apply_chat_template(
-            message, add_generation_prompt=True, tokenize=False
-        )
-        prompt_len = len(tokenizer(prompt_formatted).input_ids)
-        sampled_requests.append(
-            (prompt, prompt_formatted, prompt_len, output_len, None)
-        )
-
-    return sampled_requests
-
-
-def sample_vision_arena_requests(
-    dataset,
-    num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
-    fixed_output_len: Optional[int] = None,
-) -> List[Tuple[str, str, int, Optional[Dict[str, Collection[str]]]]]:
-    sampled_requests: List[Tuple[str, int, int, Dict[str, Collection[str]]]] = []
-    for data in dataset:
-        if len(sampled_requests) == num_requests:
-            break
-
-        prompt = data["turns"][0][0]["content"]
-
-        prompt_token_ids = tokenizer(prompt).input_ids
-        if fixed_output_len is None:
-            # Default max output len is set to 128
-            print("--hf-output-len is not provided. Using default value 128.")
-            fixed_output_len = 128
-
-        prompt_len = len(prompt_token_ids)
-        output_len = fixed_output_len
-
-        assert isinstance(data["images"][0], Image), (
-            "Input image format must be `PIL.Image.Image`, "
-            f"given {type(data['image'])}."
-        )
-        image: Image = data["images"][0]
-        image = image.convert("RGB")
-        image_data = io.BytesIO()
-        image.save(image_data, format="JPEG")
-        image_base64 = base64.b64encode(image_data.getvalue()).decode("utf-8")
-        mm_content = {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
-        }
-
-        sampled_requests.append((prompt, prompt_len, output_len, mm_content))
-
-    return sampled_requests
-
-
-def sample_hf_requests(
-    dataset_path: str,
-    dataset_subset: Optional[str],
-    dataset_split: str,
-    num_requests: int,
-    tokenizer: PreTrainedTokenizerBase,
-    random_seed: int,
-    fixed_output_len: Optional[int] = None,
-) -> List[Tuple[str, str, int, Optional[Dict[str, Collection[str]]]]]:
-
-    # Special case for vision_arena dataset
-    if dataset_path == "lmarena-ai/vision-arena-bench-v0.1" and dataset_subset is None:
-        assert dataset_split == "train"
-        dataset = load_dataset(
-            dataset_path, name=dataset_subset, split=dataset_split, streaming=True
-        )
-        dataset = dataset.shuffle(seed=random_seed)
-        return sample_vision_arena_requests(
-            dataset, num_requests, tokenizer, fixed_output_len
-        )
-
-    dataset = load_dataset(
-        dataset_path, name=dataset_subset, split=dataset_split, streaming=True
-    )
-    assert (
-        "conversations" in dataset.features
-    ), "HF Dataset must have 'conversations' column."
-
-    def filter_func(x):
-        return len(x["conversations"]) >= 2
-
-    filtered_dataset = dataset.shuffle(seed=random_seed).filter(filter_func)
-    sampled_requests: List[Tuple[str, int, int, Dict[str, Collection[str]]]] = []
-    for data in filtered_dataset:
-        if len(sampled_requests) == num_requests:
-            break
-
-        # Tokenize the prompts and completions.
-        prompt = data["conversations"][0]["value"]
-        prompt_token_ids = tokenizer(prompt).input_ids
-        completion = data["conversations"][1]["value"]
-        completion_token_ids = tokenizer(completion).input_ids
-        prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
-        if fixed_output_len is None and (prompt_len < 4 or output_len < 4):
-            # Prune too short sequences.
-            continue
-        if fixed_output_len is None and (
-            prompt_len > 1024 or prompt_len + output_len > 2048
-        ):
-            # Prune too long sequences.
-            continue
-
-        if "image" in data and isinstance(data["image"], Image):
-            image: Image = data["image"]
-            image = image.convert("RGB")
-            image_data = io.BytesIO()
-            image.save(image_data, format="JPEG")
-            image_base64 = base64.b64encode(image_data.getvalue()).decode("utf-8")
-            mm_content = {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
-            }
-        elif "image" in data and isinstance(data["image"], str):
-            if data["image"].startswith("http://") or data["image"].startswith(
-                "file://"
-            ):
-                image_url = data["image"]
+        unresolved: list[int] = []
+        adjusted: list[list[int]] = []
+        for slot, i in enumerate(pending):
+            ids, target = encoded[slot], target_lens[i]
+            if len(ids) == target:
+                token_lens[i] = target
+                continue
+            if len(ids) < target:
+                ids = (
+                    ids
+                    + rng.integers(
+                        0, tokenizer.vocab_size, size=target - len(ids)
+                    ).tolist()
+                )
             else:
-                image_url = f"file://{data['image']}"
+                ids = ids[:target]
+            unresolved.append(i)
+            adjusted.append(ids)
+        for i, text in zip(unresolved, tokenizer.batch_decode(adjusted)):
+            prompts[i] = text
+        pending = unresolved
 
-            mm_content = {
-                "type": "image_url",
-                "image_url": {"url": image_url},
-            }
-        else:
-            mm_content = None
+    if pending:
+        # Out of rounds. Report the length these prompts have rather than the
+        # target they never reached, so the mismatch statistic stays honest.
+        encoded = tokenizer([prompts[i] for i in pending], add_special_tokens=False)[
+            "input_ids"
+        ]
+        for slot, i in enumerate(pending):
+            token_lens[i] = len(encoded[slot])
 
-        sampled_requests.append((prompt, prompt_len, output_len, mm_content))
-
-    return sampled_requests
+    return prompts, token_lens
 
 
 def sample_random_requests(
@@ -371,15 +177,19 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     use_chat_template: bool = False,
-) -> List[Tuple[str, int, int]]:
-    prefix_token_ids = np.random.randint(
-        0, tokenizer.vocab_size, size=prefix_len
-    ).tolist()
+    apply_chat_template_fn: Callable = lambda x: x,
+    seed: int = 0,
+) -> list[tuple[str, int, int]]:
+    # A private generator rather than the global numpy one: sharing that makes
+    # the dataset depend on whatever else drew from it first, so re-running the
+    # same command need not produce the same prompts.
+    rng = np.random.default_rng(seed)
+
+    prefix_token_ids = rng.integers(0, tokenizer.vocab_size, size=prefix_len).tolist()
+
     if use_chat_template:
-        chat_template_dummy = tokenizer.apply_chat_template(
+        chat_template_dummy = apply_chat_template_fn(
             [{"role": "user", "content": "a"}],
-            add_generation_prompt=True,
-            tokenize=False,
         )
         tokenized_chat_template_dummy = tokenizer.encode(
             chat_template_dummy, add_special_tokens=False
@@ -387,50 +197,77 @@ def sample_random_requests(
         chat_template_len = len(tokenized_chat_template_dummy) - 1
         input_len = input_len - chat_template_len
 
-    input_lens = np.random.randint(
-        int(input_len * range_ratio),
-        input_len + 1,
-        size=num_prompts,
-    )
-    output_lens = np.random.randint(
-        int(output_len * range_ratio),
-        output_len + 1,
-        size=num_prompts,
-    )
-    offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
-    input_requests = []
-    for i in range(num_prompts):
-        prompt = tokenizer.decode(
-            prefix_token_ids
-            + [
-                (offsets[i] + i + j) % tokenizer.vocab_size
-                for j in range(input_lens[i])
-            ]
-        )
-        re_encoded_sequence = tokenizer.encode(prompt, add_special_tokens=False)[
-            : (prefix_len + input_lens[i])
-        ]
-        prompt = tokenizer.decode(re_encoded_sequence)
-        if use_chat_template:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            input_lens[i] += chat_template_len
+    def sample_uniform(seq_len):
+        lower = int(seq_len * range_ratio)
+        upper = seq_len
+        return rng.integers(lower, upper + 1, size=num_prompts).tolist()
 
-        input_requests.append(
-            (prompt, int(prefix_len + input_lens[i]), int(output_lens[i]), None)
+    input_lens = sample_uniform(input_len)
+    output_lens = sample_uniform(output_len)
+    offsets = rng.integers(0, tokenizer.vocab_size, size=num_prompts)
+
+    input_requests = []
+    mismatches = []
+    # Generated a batch at a time so the tokenizer calls can be batched; the
+    # batch also bounds how many encodings are held at once.
+    for start in range(0, num_prompts, _TOKENIZE_BATCH):
+        stop = min(start + _TOKENIZE_BATCH, num_prompts)
+        token_id_lists = [
+            prefix_token_ids
+            + (
+                (offsets[i] + i + np.arange(input_lens[i])) % tokenizer.vocab_size
+            ).tolist()
+            for i in range(start, stop)
+        ]
+        target_lens = [prefix_len + input_lens[i] for i in range(start, stop)]
+
+        prompts, prompt_lens = _round_trip_prompts(
+            tokenizer, rng, token_id_lists, target_lens
         )
+
+        if use_chat_template:
+            # The template rewrites every prompt, so the lengths measured above
+            # no longer describe what the server will receive.
+            prompts = [
+                apply_chat_template_fn([{"role": "user", "content": prompt}])
+                for prompt in prompts
+            ]
+            prompt_lens = [
+                len(ids)
+                for ids in tokenizer(prompts, add_special_tokens=False)["input_ids"]
+            ]
+
+        for slot, i in enumerate(range(start, stop)):
+            mismatches.append(prompt_lens[slot] - target_lens[slot])
+            input_requests.append(
+                (prompts[slot], prompt_lens[slot], output_lens[i], None)
+            )
+
+    header_str = f'{"-"*19}  Input/Output Length Statistics  {"-"*19}'
+    print(header_str)
+    print(
+        f" input_lens : "
+        f"min={min(r[1] for r in input_requests):<4d}  "
+        f"max={max(r[1] for r in input_requests):<4d}  "
+        f"mean={np.mean([r[1] for r in input_requests]):<7.2f}  "
+        f"avg_token_mismatch={np.mean(mismatches):<5.2f} "
+    )
+    print(
+        f" output_lens: "
+        f"min={min(r[2] for r in input_requests):<4d}  "
+        f"max={max(r[2] for r in input_requests):<4d}  "
+        f"mean={np.mean([r[2] for r in input_requests]):<7.2f} "
+    )
+    print("-" * len(header_str), "\n")
 
     return input_requests
 
 
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: list[tuple[str, int, int]],
     request_rate: float,
     burstiness: float = 1.0,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+) -> AsyncGenerator[tuple[str, int, int], None]:
     """
     Asynchronously generates requests at a specified rate
     with OPTIONAL burstiness.
@@ -471,24 +308,32 @@ async def get_request(
         await asyncio.sleep(interval)
 
 
+def _failure_reason(error: str) -> str:
+    """The last line of a traceback, which is the part that identifies it."""
+    lines = [
+        line.strip() for line in (error or "").strip().splitlines() if line.strip()
+    ]
+    return lines[-1][:110] if lines else "unknown (no error recorded)"
+
+
 def calculate_metrics(
-    input_requests: List[Tuple[str, int, int]],
-    outputs: List[RequestFuncOutput],
+    input_requests: list[tuple[str, int, int]],
+    outputs: list[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
-    selected_percentile_metrics: List[str],
-    selected_percentiles: List[float],
-    goodput_config_dict: Dict[str, float],
-) -> Tuple[BenchmarkMetrics, List[int]]:
-    actual_output_lens: List[int] = []
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    goodput_config_dict: dict[str, float],
+) -> tuple[BenchmarkMetrics, list[int]]:
+    actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
     good_completed = 0
-    itls: List[float] = []
-    tpots: List[float] = []
-    all_tpots: List[float] = []
-    ttfts: List[float] = []
-    e2els: List[float] = []
+    itls: list[float] = []
+    tpots: list[float] = []
+    all_tpots: list[float] = []
+    ttfts: list[float] = []
+    e2els: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -559,6 +404,9 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
+        # Average number of requests in flight = sum of per-request end-to-end
+        # latencies divided by the wall-clock benchmark duration.
+        concurrency=sum(e2els) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
@@ -589,6 +437,29 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+async def get_spec_stats(base_url: str) -> dict | None:
+    """Fetch speculative-decoding statistics from the ATOM server.
+
+    Returns the ``/debug/mtp_stats`` payload (which includes
+    ``average_tokens_per_forward`` = accept length = 1 + accepted draft tokens,
+    and ``acceptance_rate`` = accepted / drafted), or ``None`` when speculative
+    decoding is disabled or the endpoint is unavailable. The values are
+    cumulative since server start; for a per-config fresh server (the CI
+    benchmark flow) that is effectively this run.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{base_url}/debug/mtp_stats") as resp:
+                if resp.status != 200:
+                    return None
+                stats = await resp.json()
+    except Exception:
+        return None
+    if not stats.get("enabled"):
+        return None
+    return stats
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -596,19 +467,20 @@ async def benchmark(
     model_id: str,
     model_name: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
-    logprobs: Optional[int],
+    input_requests: list[tuple[str, int, int]],
+    logprobs: int | None,
     best_of: int,
     request_rate: float,
     burstiness: float,
     disable_tqdm: bool,
+    num_warmups: int,
     profile: bool,
-    selected_percentile_metrics: List[str],
-    selected_percentiles: List[str],
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[str],
     ignore_eos: bool,
-    goodput_config_dict: Dict[str, float],
-    max_concurrency: Optional[int],
-    lora_modules: Optional[List[str]],
+    goodput_config_dict: dict[str, float],
+    max_concurrency: int | None,
+    lora_modules: list[str] | None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -635,14 +507,30 @@ async def benchmark(
         ignore_eos=ignore_eos,
     )
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}"
+    if num_warmups > 0:
+        print(f"Warming up with {num_warmups} requests...")
+        warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
+        warmup_semaphore = (
+            asyncio.Semaphore(max_concurrency)
+            if max_concurrency
+            else contextlib.nullcontext()
         )
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+
+        async def warmup_limited_req_fn():
+            async with warmup_semaphore:
+                return await request_func(
+                    request_func_input=test_input, pbar=warmup_pbar
+                )
+
+        warmup_tasks = []
+        for _ in range(num_warmups):
+            task = asyncio.create_task(warmup_limited_req_fn())
+            warmup_tasks.append(task)
+        _ = await asyncio.gather(*warmup_tasks)
+
+        if warmup_pbar is not None:
+            warmup_pbar.close()
+        print("Warmup completed.")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -691,8 +579,10 @@ async def benchmark(
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
+    print("Starting main benchmark run...")
+
     benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
+    tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = request
         req_model_id, req_model_name = model_id, model_name
@@ -717,7 +607,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
@@ -749,8 +639,21 @@ async def benchmark(
         goodput_config_dict=goodput_config_dict,
     )
 
+    spec_stats = await get_spec_stats(base_url)
+    accept_length = spec_stats.get("average_tokens_per_forward") if spec_stats else None
+    acceptance_rate = spec_stats.get("acceptance_rate") if spec_stats else None
+
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    failures = collections.Counter(
+        _failure_reason(output.error) for output in outputs if not output.success
+    )
+    if failures:
+        # Every metric below is over the survivors, so a run that lost requests
+        # must not report its throughput as though it had not.
+        print("{:<40} {:<10}".format("FAILED requests:", sum(failures.values())))
+        for reason, count in failures.most_common(5):
+            print(f"{'':4}{count:<8} {reason}")
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
@@ -775,6 +678,11 @@ async def benchmark(
             "Total Token throughput (tok/s):", metrics.total_token_throughput
         )
     )
+    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+    if accept_length:
+        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if acceptance_rate is not None:
+        print("{:<40} {:<10.2f}".format("Acceptance rate (%):", acceptance_rate * 100))
 
     result = {
         "duration": benchmark_duration,
@@ -785,6 +693,9 @@ async def benchmark(
         "request_goodput:": metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
+        "concurrency": metrics.concurrency,
+        "accept_length": accept_length,
+        "acceptance_rate": acceptance_rate,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -853,7 +764,7 @@ def check_goodput_args(args):
                 raise ValueError(
                     f"Invalid metric name found, {slo_name}: {slo_val}. "
                     "The service level objective name should be one of "
-                    f"{str(VALID_NAMES)}. "
+                    f"{VALID_NAMES!s}. "
                 )
             if slo_val < 0:
                 raise ValueError(
@@ -881,7 +792,7 @@ def parse_goodput(slo_pairs):
 
 
 def save_to_pytorch_benchmark_format(
-    args: argparse.Namespace, results: Dict[str, Any], file_name: str
+    args: argparse.Namespace, results: dict[str, Any], file_name: str
 ) -> None:
     metrics = [
         "median_ttft_ms",
@@ -917,6 +828,14 @@ def save_to_pytorch_benchmark_format(
 
 
 def main(args: argparse.Namespace):
+    # Raise the open-file soft limit before opening any connections. At high
+    # --max-concurrency each in-flight request is a socket (fd); the default
+    # RLIMIT_NOFILE soft (~1024) is exhausted client-side (EMFILE on socket()),
+    # silently dropping requests so most never reach the server. The server
+    # already calls set_ulimit() at startup; the client must too.
+    from atom.utils import set_ulimit
+
+    set_ulimit()
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -939,81 +858,12 @@ def main(args: argparse.Namespace):
         tokenizer_mode=tokenizer_mode,
         trust_remote_code=args.trust_remote_code,
     )
+    custom_encoder = load_custom_message_encoder(model_id)
+    apply_chat_template_fn = functools.partial(
+        apply_chat_template, tokenizer, custom_encoder
+    )
 
-    if args.dataset is not None:
-        warnings.warn(
-            "The '--dataset' argument will be deprecated in the next "
-            "release. Please use '--dataset-name' and "
-            "'--dataset-path' in the future runs.",
-            stacklevel=2,
-        )
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-        )
-
-    elif args.dataset_name == "sharegpt":
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-        )
-
-    elif args.dataset_name == "burstgpt":
-        input_requests = sample_burstgpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            random_seed=args.seed,
-            tokenizer=tokenizer,
-        )
-
-    elif args.dataset_name == "sonnet":
-        # Do not format the prompt, pass to message directly
-        if args.backend == "openai-chat":
-            input_requests = sample_sonnet_requests(
-                dataset_path=args.dataset_path,
-                num_requests=args.num_prompts,
-                input_len=args.sonnet_input_len,
-                output_len=args.sonnet_output_len,
-                prefix_len=args.sonnet_prefix_len,
-                tokenizer=tokenizer,
-            )
-            input_requests = [
-                (prompt, prompt_len, output_len, None)
-                for prompt, prompt_formatted, prompt_len, output_len, _ in input_requests
-            ]
-        else:
-            assert (
-                tokenizer.chat_template or tokenizer.default_chat_template
-            ), "Tokenizer/model must have chat template for sonnet dataset."
-            input_requests = sample_sonnet_requests(
-                dataset_path=args.dataset_path,
-                num_requests=args.num_prompts,
-                input_len=args.sonnet_input_len,
-                output_len=args.sonnet_output_len,
-                prefix_len=args.sonnet_prefix_len,
-                tokenizer=tokenizer,
-            )
-            input_requests = [
-                (prompt_formatted, prompt_len, output_len, None)
-                for prompt, prompt_formatted, prompt_len, output_len, _ in input_requests
-            ]
-
-    elif args.dataset_name == "hf":
-        input_requests = sample_hf_requests(
-            dataset_path=args.dataset_path,
-            dataset_subset=args.hf_subset,
-            dataset_split=args.hf_split,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            random_seed=args.seed,
-            fixed_output_len=args.hf_output_len,
-        )
-
-    elif args.dataset_name == "random":
+    if args.dataset_name == "random":
         input_requests = sample_random_requests(
             prefix_len=args.random_prefix_len,
             input_len=args.random_input_len,
@@ -1021,7 +871,9 @@ def main(args: argparse.Namespace):
             num_prompts=args.num_prompts,
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
+            apply_chat_template_fn=apply_chat_template_fn,
             use_chat_template=args.use_chat_template,
+            seed=args.seed,
         )
 
     else:
@@ -1047,6 +899,7 @@ def main(args: argparse.Namespace):
             request_rate=args.request_rate,
             burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
+            num_warmups=args.num_warmups,
             profile=args.profile,
             selected_percentile_metrics=args.percentile_metrics.split(","),
             selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
@@ -1059,10 +912,13 @@ def main(args: argparse.Namespace):
 
     # Save config and results to json
     if args.save_result:
-        result_json: Dict[str, Any] = {}
+        result_json: dict[str, Any] = {}
 
         # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        # astimezone() keeps the stamp in the operator's own timezone, which is
+        # how a result file is read, while staying timezone-aware.
+        current_dt = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
         result_json["date"] = current_dt
         result_json["backend"] = backend
         result_json["model_id"] = model_id
@@ -1091,6 +947,21 @@ def main(args: argparse.Namespace):
         # Merge with benchmark result
         result_json = {**result_json, **benchmark_result}
 
+        if not args.save_detailed:
+            # Remove fields with too many data points
+            for field in [
+                "input_lens",
+                "output_lens",
+                "ttfts",
+                "itls",
+                "generated_texts",
+                "errors",
+            ]:
+                if field in result_json:
+                    del result_json[field]
+                if field in benchmark_result:
+                    del benchmark_result[field]
+
         # Save to file
         base_model_id = model_id.split("/")[-1]
         max_concurrency_str = (
@@ -1098,7 +969,7 @@ def main(args: argparse.Namespace):
             if args.max_concurrency is not None
             else ""
         )
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  # noqa
+        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -1134,16 +1005,10 @@ if __name__ == "__main__":
         help="API endpoint.",
     )
     parser.add_argument(
-        "--dataset",
-        type=str,
-        default=None,
-        help="Path to the ShareGPT dataset, will be deprecated in the " "next release.",
-    )
-    parser.add_argument(
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=["random"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1176,7 +1041,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer",
         type=str,
-        help="Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
+        help="Name or path of the tokenizer, if not using the default tokenizer.",
     )
     parser.add_argument(
         "--best-of",
@@ -1245,6 +1110,14 @@ if __name__ == "__main__":
         "--save-result",
         action="store_true",
         help="Specify to save benchmark results to a json file",
+    )
+    parser.add_argument(
+        "--save-detailed",
+        action="store_true",
+        default=False,
+        help="When saving results, include detailed per-request data "
+        "(input_lens, output_lens, ttfts, itls, generated_texts, errors). "
+        "By default, only aggregated metrics are saved to reduce file size.",
     )
     parser.add_argument(
         "--metadata",
@@ -1416,6 +1289,8 @@ if __name__ == "__main__":
         "launching the server. For each request, the "
         "script chooses a LoRA module at random.",
     )
+
+    parser.add_argument("--num-warmups", type=int, default=1)
 
     args = parser.parse_args()
     main(args)

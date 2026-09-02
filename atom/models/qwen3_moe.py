@@ -1,4 +1,4 @@
-from typing import Optional, Union, Any, Iterable
+from typing import Optional, Union, Any
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -33,7 +33,6 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from torch import nn
-from atom.model_loader.loader import load_model_in_plugin_mode
 
 # import torch.distributed as dist
 from transformers import PretrainedConfig
@@ -108,6 +107,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=False,
+            has_bias=False,
             prefix=f"{prefix}.experts",
             config=config,
         )
@@ -133,7 +133,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
+        # Mori all-to-all assembles the per-token output during finalize.
+        # Pure TP+EP only computes local expert contributions and still needs
+        # the outer TP all-reduce because this FusedMoE uses reduce_results=False.
+        output_is_assembled = (
+            self.experts.moe_parallel_config.use_all2all_kernels
+            and self.experts.quant_method.using_modular_kernel
+        )
+        if (
+            self.tp_size > 1
+            and not output_is_assembled
+            and not ENABLE_ALLREDUCE_RMSNORM_FUSION
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
@@ -183,6 +194,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=atom_config.quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.o_proj = RowParallelLinear(
@@ -191,6 +203,7 @@ class Qwen3MoeAttention(nn.Module):
             bias=False,
             quant_config=atom_config.quant_config,
             reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -245,9 +258,13 @@ class Qwen3MoeAttention(nn.Module):
                 query=q, key=k, value=v, positions=positions, q_scale=None, qkv=qkv
             )
         else:
-            # Add qk-norm
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            # Add qk-norm (per-head)
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
 
             attn_output = self.attn(
                 query=q, key=k, value=v, positions=positions, **model_kwargs
@@ -521,14 +538,3 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # load weights in plugin mode and discard passed weights generator
-        # here prefix is "model." because Qwen3MoeForCausalLM is constructed in model
-        # wrapper class, so the name of loaded weights are prefixed with "model.".
-        # The vLLM will check the name of the loaded weights to make sure all the
-        # weights are loaded correctly
-        loaded_weights_record = load_model_in_plugin_mode(
-            model=self, config=self.atom_config, prefix="model."
-        )
-        return loaded_weights_record

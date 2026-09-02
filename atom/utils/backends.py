@@ -201,8 +201,7 @@ class CompilerManager:
         assert compiled_graph is not None, "Failed to compile the graph"
 
         # store the artifact in the cache
-        # if not envs.VLLM_DISABLE_COMPILE_CACHE and handle is not None:
-        if True and handle is not None:
+        if handle is not None:
             self.cache[(runtime_shape, graph_index, self.compiler.name)] = handle
             compilation_counter.num_cache_entries_updated += 1
             self.is_cache_updated = True
@@ -228,6 +227,34 @@ class CompilerManager:
                     str(runtime_shape),
                     self.compiler.name,
                     handle,
+                )
+
+        # When mark-trace is enabled, post-processing may rewrite generated
+        # artifact sources. Force reloading from cache artifact so the current
+        # process uses the rewritten artifact immediately.
+        try:
+            from atom.utils.graph_marker import is_graph_marker_enabled
+
+            force_reload = is_graph_marker_enabled()
+        except Exception:
+            force_reload = False
+        if force_reload and handle is not None and not self.disable_cache:
+            try:
+                reloaded_graph = self.load(
+                    graph, example_inputs, graph_index, runtime_shape
+                )
+                if reloaded_graph is not None:
+                    compiled_graph = reloaded_graph
+                    logger.info(
+                        "Force reloaded compiled graph from cache artifact "
+                        "(graph_index=%s, runtime_shape=%s).",
+                        graph_index,
+                        runtime_shape,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to force reload compiled graph from cache artifact; "
+                    "falling back to in-memory compiled callable."
                 )
 
         # after compiling the last graph, record the end time
@@ -261,13 +288,6 @@ def _split_judge_func(node: fx.Node) -> bool:
     if node.op == "call_function" and (
         hasattr(node.target, "spliting_op") and (node.target.spliting_op)
     ):
-        return True
-
-    # When plugin mode(vLLM), the attention impl op is registered
-    # as unified_attention
-    from atom.plugin import is_vllm
-
-    if is_vllm() and "unified_attention" in node.name:
         return True
 
     return False
@@ -400,26 +420,32 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 self.vllm_backend,
             )
 
-            # if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            #     # resolve the static graph wrapper class (e.g. CUDAGraphWrapper
-            #     # class) as platform dependent.
-            #     static_graph_wrapper_class = resolve_obj_by_qualname(
-            #         get_static_graph_wrapper_cls())
+            # Wrap each compiled dense piece in a PIECEWISE CUDAGraphWrapper so
+            # it captures/replays its own cudagraph (attention runs eager between
+            # pieces). Gated on cudagraph_mode requesting piecewise; otherwise
+            # keep the bare piecewise_backend (compiled, no per-piece cudagraph —
+            # the pre-existing behavior, e.g. FULL manual capture in the runner).
+            _cg_mode = self.compilation_config.cudagraph_mode
+            # Driven by --cudagraph-mode. Default FULL -> requires_piecewise is
+            # False -> bare piecewise_backend (compiled pieces inside the manual
+            # FULL whole-forward capture, i.e. existing behavior). PIECEWISE ->
+            # wrap each piece in its own cudagraph.
+            _pw_cg = _cg_mode is not None and _cg_mode.requires_piecewise_compilation()
+            if _pw_cg:
+                from .cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
 
-            #     # Always assign PIECEWISE runtime mode to the
-            #     # CUDAGraphWrapper for piecewise_backend, to distinguish
-            #     # it from the FULL cudagraph runtime mode, no matter it
-            #     # is wrapped on a full or piecewise fx graph.
-            #     self.module.__dict__[target] = static_graph_wrapper_class(
-            #         runnable=piecewise_backend,
-            #         vllm_config=self.vllm_config,
-            #         runtime_mode=CUDAGraphMode.PIECEWISE,
-            #         cudagraph_options=CUDAGraphOptions(
-            #             debug_log_enable=piecewise_backend.is_first_graph,
-            #             gc_disable=not piecewise_backend.is_first_graph,
-            #             weak_ref_output=piecewise_backend.is_last_graph))
-            # else:
-            self.module.__dict__[target] = piecewise_backend
+                self.module.__dict__[target] = CUDAGraphWrapper(
+                    runnable=piecewise_backend,
+                    vllm_config=self.vllm_config,
+                    runtime_mode=CUDAGraphMode.PIECEWISE,
+                    cudagraph_options=CUDAGraphOptions(
+                        debug_log_enable=piecewise_backend.is_first_graph,
+                        gc_disable=not piecewise_backend.is_first_graph,
+                        weak_ref_output=piecewise_backend.is_last_graph,
+                    ),
+                )
+            else:
+                self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
@@ -555,9 +581,9 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>":
+                if filepath == "<string>" or filepath == "<frozen os>":
                     # This means the function was dynamically generated, with
-                    # e.g. exec(). We can't actually check these.
+                    # e.g. exec() or frozen os module. We can't actually check these.
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
@@ -596,7 +622,6 @@ class VllmBackend:
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
 
-        # disable_cache = envs.VLLM_DISABLE_COMPILE_CACHE
         disable_cache = False
 
         if disable_cache:

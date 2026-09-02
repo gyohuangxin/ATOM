@@ -3,12 +3,136 @@
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
-from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
+
+from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
+from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
+from atom.utils import envs
+from atom.utils.decorators import mark_trace
+from atom.utils.forward_context import ForwardContext, get_forward_context
+
+
+@triton.jit
+def _masked_embedding_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    vocab_start_idx,
+    vocab_end_idx,
+    stride_w_row,
+    stride_out_row,
+    N,
+    D,
+    BLOCK_D: tl.constexpr,
+):
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+    if pid_row >= N:
+        return
+
+    token_id = tl.load(x_ptr + pid_row)
+    in_range = (token_id >= vocab_start_idx) & (token_id < vocab_end_idx)
+    local_idx = token_id - vocab_start_idx
+
+    col_start = pid_col * BLOCK_D
+    cols = col_start + tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+
+    emb = tl.load(
+        weight_ptr + local_idx * stride_w_row + cols,
+        mask=in_range & col_mask,
+        other=0.0,
+    )
+
+    tl.store(out_ptr + pid_row * stride_out_row + cols, emb, mask=col_mask)
+
+
+def _masked_embedding_launcher(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    N = x.numel()
+    D = weight.shape[1]
+    BLOCK_D = 1024
+    out = torch.empty(N, D, dtype=weight.dtype, device=weight.device)
+    grid = (N, triton.cdiv(D, BLOCK_D))
+    _masked_embedding_kernel[grid](
+        x,
+        weight,
+        out,
+        vocab_start_idx,
+        vocab_end_idx,
+        weight.stride(0),
+        out.stride(0),
+        N,
+        D,
+        BLOCK_D=BLOCK_D,
+    )
+    return out
+
+
+def _masked_embedding_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    return torch.empty(
+        x.numel(),
+        weight.shape[1],
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_masked_embedding_fake)
+def masked_embedding(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
+
+
+def _replicated_embedding_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty(
+        x.numel(),
+        weight.shape[1],
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+
+
+@torch_compile_guard(gen_fake=_replicated_embedding_fake)
+def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Keep the lookup opaque to torch.compile: inductor otherwise fuses the
+    # embedding gather into the surrounding graph, which corrupts the MTP draft
+    # rollout (acceptance collapses ~69%->45%) — the same reason
+    # VocabParallelEmbedding routes through the masked_embedding custom op.
+    #
+    # Route through the masked kernel with the full-table range [0, num_rows) so
+    # out-of-range ids never reach a raw gather. Under async scheduling + MTP
+    # spec-decode, input_ids can transiently carry the optimistic placeholder
+    # token -1 (an unresolved "assumed-accepted" draft/bonus slot, produced in
+    # gpu_model_runner and read back via prepare_next_token_ids_padded's backup
+    # before the deferred correction lands) — for BOTH the target and the shared
+    # draft embedding. A raw F.embedding(-1) reads the row before the table ->
+    # random illegal memory access. The masked load returns a zero vector for any
+    # out-of-range id: bit-identical to F.embedding for every valid token, and
+    # matching vLLM's VocabParallelEmbedding (which masks the same -1 to 0) so the
+    # unverified -1 slots — whose output is discarded/corrected by async
+    # spec-decode — see the same value native does. No accuracy change.
+    return _masked_embedding_launcher(x, weight, 0, weight.shape[0])
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -17,8 +141,10 @@ class VocabParallelEmbedding(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
         self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
         assert num_embeddings % self.tp_size == 0
@@ -26,8 +152,8 @@ class VocabParallelEmbedding(nn.Module):
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
-        self.weight = nn.Parameter(
-            torch.empty(self.num_embeddings_per_partition, embedding_dim)
+        self.weight = atom_parameter(
+            torch.empty(self.num_embeddings_per_partition, embedding_dim),
         )
         self.weight.weight_loader = self.weight_loader
 
@@ -39,16 +165,61 @@ class VocabParallelEmbedding(nn.Module):
         assert param_data.size() == loaded_weight.size()
         param_data.copy_(loaded_weight)
 
+    @mark_trace
     def forward(self, x: torch.Tensor):
+        # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
         if self.tp_size > 1:
-            mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
-            # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
-            x = mask * (x - self.vocab_start_idx)
-        y = F.embedding(x, self.weight)
-        if self.tp_size > 1:
-            y.masked_fill_(~mask.unsqueeze(1), 0)
+            y = masked_embedding(
+                x, self.weight, self.vocab_start_idx, self.vocab_end_idx
+            )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+        else:
+            y = F.embedding(x, self.weight)
         return y
+        # if self.tp_size > 1:
+        #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
+        #     # mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+        #     x = mask * (x - self.vocab_start_idx)
+        # y = F.embedding(x, self.weight)
+        # if self.tp_size > 1:
+        #     y.masked_fill_(~mask.unsqueeze(1), 0)
+        #     y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
+        # return y
+
+
+class ReplicatedEmbedding(nn.Module):
+    """Full vocab embedding replicated on every TP rank (no sharding).
+
+    Each rank holds the complete ``[num_embeddings, embedding_dim]`` table and
+    does a purely local lookup, so the forward needs **no all-reduce** — unlike
+    ``VocabParallelEmbedding``, which shards the vocab and must all-reduce the
+    masked partial lookups to reconstruct the full vector.
+
+    Trades ``(tp-1)/tp`` of the embedding's memory per rank for one fewer
+    collective per embed. Use ONLY where the embedding is independent of any
+    sharded ``lm_head`` (e.g. the EAGLE3 draft, whose embed/lm_head are separate
+    tensors). Do NOT use for an embedding shared/tied with a TP-sharded lm_head
+    or with the target model's sharded embedding.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.weight = atom_parameter(
+            torch.empty(num_embeddings, embedding_dim),
+        )
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        # Full (un-sharded) copy: every rank gets the complete table.
+        assert param.data.size() == loaded_weight.size(), (
+            f"ReplicatedEmbedding expects the full weight "
+            f"{tuple(param.data.size())}, got {tuple(loaded_weight.size())}"
+        )
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor):
+        return replicated_embedding(x, self.weight)
 
 
 class ParallelLMHead(VocabParallelEmbedding):
@@ -62,7 +233,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     ):
         super().__init__(num_embeddings, embedding_dim)
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.num_embeddings_per_partition))
+            self.bias = atom_parameter(
+                torch.empty(self.num_embeddings_per_partition),
+            )
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
@@ -76,9 +249,12 @@ class ParallelLMHead(VocabParallelEmbedding):
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
+            if self._can_use_dp_sharded_head(context):
+                return self._dp_sharded_logits(x)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
-            logits = tensor_model_parallel_all_gather(logits)
+            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+            logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
             # all_logits = (
             #     [torch.empty_like(logits) for _ in range(self.tp_size)]
             #     if self.tp_rank == 0
@@ -87,3 +263,152 @@ class ParallelLMHead(VocabParallelEmbedding):
             # dist.gather(logits, all_logits, 0)
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
+
+    def compute_argmax_token(
+        self, x: torch.Tensor, *, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Greedy argmax token over the (TP-sharded) vocab — returns ``[N]`` token
+        ids WITHOUT all-gathering the full ``[N, vocab]`` logits.
+
+        For greedy speculative drafting only the argmax is needed, so each rank
+        reduces its own vocab shard to ``(max_val, global_idx)`` and we all-gather
+        just those ``[N, 2]`` (tp small) instead of the O(vocab) logits. Token
+        selection is identical to a full-logits ``argmax``: the values compared
+        are the same bf16 logits (fp32-packed exactly), and tie-breaking matches
+        the lowest global index — ``torch.max`` picks the lowest local index, and
+        ``argmax`` over ranks picks the lowest rank (== lowest vocab range).
+        """
+        if out is not None:
+            assert out.shape == x.shape[:-1], (
+                f"argmax out has shape {tuple(out.shape)}, expected "
+                f"{tuple(x.shape[:-1])}"
+            )
+            assert (
+                out.dtype == torch.long and out.device == x.device
+            ), "argmax out must be an int64 tensor on the input device"
+        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
+        if self.tp_size <= 1:
+            token = logits.argmax(dim=-1)
+            return token if out is None else out.copy_(token)
+        # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
+        # per-rank reductions ([N, 2]) instead of the full logits.
+        packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
+        # Custom, like the logits path above: `graph_capture()` arms only that
+        # one, and a draft pass records this. The RCCL path is what made the
+        # head un-capturable on HIP at TP > 1.
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        gathered = get_tp_group().all_gather(packed, dim=0, use_custom=use_custom)
+        gathered = gathered.view(self.tp_size, -1, 2)
+        winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
+        token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
+        return token.to(torch.long) if out is None else out.copy_(token)
+
+    # ------------------------------------------------------------------
+    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
+    #
+    # Precondition (checked by `_can_use_dp_sharded_head`): the model TP group is size 1
+    # (pure DP) and the DP group is size > 1. The lm_head weight is currently
+    # replicated on every DP rank, so each rank slices out its own vocab shard
+    # `weight[dp_rank*V/dp : (dp_rank+1)*V/dp]` at runtime — no weight-loader
+    # change needed for this prototype (the full weight still costs VRAM; a real
+    # rollout should shard it at load time).
+    # ------------------------------------------------------------------
+    def _can_use_dp_sharded_head(self, context) -> bool:
+        """Whether this step may run the DP-sharded LM head (pure-DP decode only).
+
+        Every DP rank must reach the SAME verdict from globally-synced state, or
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
+        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+
+        `is_prefill` below is per-rank, which is safe only because
+        `running_tokens_are_unified` is the DP-reduced form of the same
+        question: a prefilling peer drives it False on every rank, so no rank
+        can answer True here while another answers False.
+        """
+        dp_group = get_dp_group()
+        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
+        if (
+            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
+            or self.tp_size != 1
+            or dp_group.world_size <= 1
+            or self.num_embeddings % dp_group.world_size != 0
+        ):
+            return False
+        # Per-step: all ranks at one height. `is_draft` is its own question,
+        # not shorthand for the flag below -- a drafter states uniformity per
+        # pass, so a draft arrives with either answer. Prefill is excluded
+        # because x is sliced to 1 row/seq, mismatching the pad target.
+        if (
+            context is None
+            or getattr(context, "is_draft", False)
+            or getattr(context, "is_prefill", False)
+            or not getattr(context, "running_tokens_are_unified", False)
+        ):
+            return False
+        return get_forward_context().dp_metadata is not None
+
+    def _dp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits for this rank's own rows via a DP-sharded head.
+
+        x: ``[local_rows, dim]`` (this DP rank's tokens). Under uniform decode
+        every rank pads to the DP-wide ``running_tokens`` so the collective is
+        fixed-size and identical on all ranks; the padded tail is dropped at the
+        end. returns: ``[local_rows, vocab]``.
+        """
+        mode = envs.ATOM_DP_LM_HEAD_MODE
+        dp_group = get_dp_group()
+        dp_size = dp_group.world_size
+        dp_rank = dp_group.rank_in_group
+        vshard = self.num_embeddings // dp_size
+
+        fc = get_forward_context()
+        local_rows = x.shape[0]
+        max_rows = int(fc.context.running_tokens)
+        # running_tokens is the padded height, so local_rows <= max_rows always;
+        # keep the guard as a loud tripwire rather than a silent DP-wide hang.
+        assert local_rows <= max_rows, (
+            f"DP LM head: local_rows={local_rows} > running_tokens={max_rows}; "
+            "hidden height exceeds the DP-uniform gather bucket."
+        )
+        if local_rows < max_rows:
+            x = torch.cat([x, x.new_zeros(max_rows - local_rows, x.shape[1])], dim=0)
+
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+
+        # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
+        gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
+        w = self.weight[dp_rank * vshard : (dp_rank + 1) * vshard]  # [V/dp, dim]
+        b = (
+            None
+            if self.bias is None
+            else self.bias[dp_rank * vshard : (dp_rank + 1) * vshard]
+        )
+        logits_shard = tgemm.mm(gathered, w, b)  # [dp_size * max_rows, V/dp]
+
+        if mode == "all2all":
+            # Send each destination rank only the block of rows it owns; receive
+            # this rank's rows on every peer's vocab shard.
+            logits_shard = logits_shard.contiguous()
+            out = torch.empty_like(logits_shard)
+            torch.distributed.all_to_all_single(
+                out.view(-1), logits_shard.view(-1), group=dp_group.device_group
+            )
+            # out is source-major [dp_size, max_rows, vshard]; the sampler wants
+            # the vocab shards concatenated along dim 1. The (dp <-> rows) axis
+            # swap is non-contiguous, so the following reshape materialises one
+            # copy — inherent to converting all-to-all's source-major output to
+            # row-major full-vocab logits. Slice to the real rows *before* the
+            # reshape so the copy only touches local_rows (not the padded tail).
+            return (
+                out.view(dp_size, max_rows, vshard)[:, :local_rows, :]
+                .permute(1, 0, 2)
+                .reshape(local_rows, dp_size * vshard)
+            )
+
+        # mode == "allgather": all-gather every rank's [Σrows, V/dp] shard into
+        # the full vocab, then scatter this rank's own row block.
+        global_logits = dp_group.all_gather(
+            logits_shard, dim=1, use_custom=use_custom
+        )  # [Σrows, V]
+        start = dp_rank * max_rows
+        return global_logits[start : start + local_rows].contiguous()
